@@ -8,7 +8,7 @@ Implements three key improvements:
 
 Usage:
     python main.py --model meta-llama/Llama-3.1-8B-Instruct --dataset copa
-    python main.py --model Qwen/Qwen2.5-7B-Instruct --dataset sst2 --ablation
+    python main.py --model Qwen/Qwen3-7B-Instruct --dataset sst2 --ablation
 """
 import os
 import sys

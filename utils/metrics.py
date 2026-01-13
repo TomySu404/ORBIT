@@ -12,7 +12,9 @@ from dataclasses import dataclass, field
 PUNCTUATION = [
     '.</s>', '.\n', '.', ';', '!', ',', '?', '\n',
     '</s>', '<pad>', ' ', ':', '"', "'", '(', ')',
-    '[', ']', '{', '}', '-', '_', '/'
+    '[', ']', '{', '}', '-', '_', '/', '\\', '*', 
+    '&', '^', '%', '$', '#', '@', '~', '`', '|', 
+    '<', '>', '=', '+'
 ]
 
 
@@ -23,7 +25,8 @@ def normalize_answer(answer: str) -> str:
     Performs:
     1. Strip whitespace
     2. Convert to lowercase
-    3. Remove punctuation
+    3. Take only the first line/sentence if multi-line
+    4. Remove punctuation
     
     Args:
         answer: Raw answer string.
@@ -31,9 +34,16 @@ def normalize_answer(answer: str) -> str:
     Returns:
         Normalized answer string.
     """
-    ans = answer.strip().lower()
+    if not answer:
+        return ""
+    
+    # Take first line and convert to lowercase
+    ans = str(answer).strip().lower().split('\n')[0]
+    
+    # Remove all punctuation from the list
     for p in PUNCTUATION:
         ans = ans.replace(p.lower(), "")
+    
     return ans.strip()
 
 

@@ -10,11 +10,11 @@ Key benefits:
 2. More pairs per sample (better statistics, lower variance)
 3. Automatic classification of correct/incorrect responses
 """
-import torch
-from typing import List, Tuple, Optional
+from typing import List, Optional
 from dataclasses import dataclass, field
 
-from ..config import RolloutConfig
+from config import RolloutConfig
+from utils.metrics import compute_accuracy, normalize_answer
 
 
 @dataclass
@@ -70,12 +70,6 @@ class RolloutGenerator:
     leading to better alignment between the steering vector and actual model behavior.
     """
     
-    # Punctuation marks to strip when comparing answers
-    PUNCTUATION = [
-        '.</s>', '.\n', '.', ';', '!', ',', '?', '\n', 
-        '</s>', '<pad>', ' ', ':', '"', "'", '(', ')'
-    ]
-    
     def __init__(self, model, config: RolloutConfig):
         """
         Initialize rollout generator.
@@ -88,57 +82,12 @@ class RolloutGenerator:
         self.config = config
     
     def _normalize_answer(self, answer: str) -> str:
-        """
-        Normalize answer string for comparison.
-        
-        Strips whitespace, punctuation, and converts to lowercase.
-        
-        Args:
-            answer: Raw answer string.
-        
-        Returns:
-            Normalized answer string.
-        """
-        ans = answer.strip().lower()
-        for p in self.PUNCTUATION:
-            ans = ans.replace(p.lower(), "")
-        return ans.strip()
+        """Normalize answer string using shared utility."""
+        return normalize_answer(answer)
     
     def _is_correct(self, response: str, reference: str) -> bool:
-        """
-        Check if a response matches the reference answer.
-        
-        Uses normalized comparison with support for partial matching
-        (reference contained in response).
-        
-        Args:
-            response: Model-generated response.
-            reference: Ground truth answer.
-        
-        Returns:
-            True if response is considered correct.
-        """
-        norm_response = self._normalize_answer(response)
-        norm_reference = self._normalize_answer(reference)
-        
-        # Empty check
-        if not norm_reference:
-            return False
-        
-        # Exact match
-        if norm_response == norm_reference:
-            return True
-        
-        # Check if reference is contained at the start of response
-        # This handles cases like "A" matching "A. The answer is..."
-        if norm_response.startswith(norm_reference):
-            return True
-        
-        # Check if reference is a single token and response starts with it
-        if len(norm_reference) <= 2 and norm_response[:len(norm_reference)] == norm_reference:
-            return True
-        
-        return False
+        """Check correctness using shared utility."""
+        return compute_accuracy(response, reference)
     
     def _reread_generate(self, question: str, correct_answer: str) -> str:
         """
@@ -173,22 +122,14 @@ class RolloutGenerator:
         Returns:
             List of generated response strings.
         """
-        responses = []
-        
-        # Generate responses one at a time for diversity
-        # (batch generation tends to produce more similar outputs)
-        for _ in range(self.config.num_rollouts):
-            response = self.model.generate(
+        return self.model.generate(
                 question,
                 max_new_tokens=self.config.max_new_tokens,
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
                 do_sample=True,
-                num_return_sequences=1
-            )[0]
-            responses.append(response)
-        
-        return responses
+                num_return_sequences=self.config.num_rollouts
+        )
     
     def build_contrastive_pairs(
         self,

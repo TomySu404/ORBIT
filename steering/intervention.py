@@ -15,10 +15,10 @@ Where:
 """
 import torch
 from torch import nn
-from typing import Dict, List, Callable, Optional
+from typing import Dict, List, Callable, Union
 from contextlib import contextmanager
 
-from ..config import InterventionConfig
+from config import InterventionConfig
 from .diff_vector import DiffVectorResult
 
 
@@ -28,7 +28,7 @@ class ActivationIntervention:
     
     Features:
     1. Continuous scaling (not binary masking)
-    2. Layer-wise control for ablation studies
+    2. Layer-wise control
     3. Adjustable intervention strength
     4. Efficient hook-based implementation
     
@@ -58,6 +58,9 @@ class ActivationIntervention:
         
         # Pre-compute intervention vectors for efficiency
         self._intervention_vectors = self._precompute_interventions()
+        
+        # Track initial sequence length for prefill-only intervention
+        self._initial_seq_len = None
     
     def _precompute_interventions(self) -> Dict[str, torch.Tensor]:
         """
@@ -74,14 +77,13 @@ class ActivationIntervention:
         
         for name in self.diff_result.diff_vectors:
             beta = self.diff_result.scaling_weights[name]
-            mu = self.diff_result.diff_vectors[name]
             
-            # Intervention = strength * beta * mu
-            # Note: For max_norm scaling, beta ≈ mu/max(|mu|)
-            # So intervention ≈ strength * mu^2 / max(|mu|)
+            # Intervention = strength * beta
+            # Note: beta is already computed from diff_vectors (mu) with scaling
+            # For max_norm scaling, beta = mu/max(|mu|)
+            # So intervention = strength * mu / max(|mu|)
             # This naturally emphasizes dimensions with larger differences
-            intervention = strength * beta * mu
-            
+            intervention = strength * beta
             # Move to model device
             interventions[name] = intervention.to(self.model.device)
         
@@ -135,6 +137,21 @@ class ActivationIntervention:
                 rest = None
                 is_tuple = False
             
+            # Check if prefill-only intervention is enabled
+            current_seq_len = hidden.shape[1]
+            if self.config.prefill_only:
+                # Initialize sequence length on first forward pass
+                if self._initial_seq_len is None:
+                    self._initial_seq_len = current_seq_len
+                
+                # Only intervene if sequence length equals initial length (prefill phase)
+                # Once sequence length increases, we're in generation phase - skip intervention
+                if current_seq_len != self._initial_seq_len:
+                    # Generation phase - skip intervention
+                    if is_tuple:
+                        return (hidden,) + rest
+                    return hidden
+            
             # Ensure intervention is on correct device and dtype
             interv = intervention.to(hidden.device).to(hidden.dtype)
             
@@ -177,6 +194,10 @@ class ActivationIntervention:
         Yields:
             None (intervention is applied via hooks).
         """
+        # Reset sequence length tracking for prefill-only mode
+        if self.config.prefill_only:
+            self._initial_seq_len = None
+        
         handles = []
         
         try:
@@ -196,16 +217,19 @@ class ActivationIntervention:
             # Clean up all hooks
             for handle in handles:
                 handle.remove()
+            # Reset sequence length tracking
+            if self.config.prefill_only:
+                self._initial_seq_len = None
     
     @torch.no_grad()
     def generate_with_intervention(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         max_new_tokens: int = 32,
         temperature: float = 1.0,
         do_sample: bool = False,
         token_position: int = -1
-    ) -> str:
+    ) -> Union[str, List[str]]:
         """
         Generate response with activation intervention applied.
         
@@ -213,14 +237,14 @@ class ActivationIntervention:
         during each forward pass of the generation loop.
         
         Args:
-            prompt: Input prompt.
+            prompt: Input prompt or list of prompts.
             max_new_tokens: Maximum tokens to generate.
             temperature: Sampling temperature.
             do_sample: Whether to use sampling.
             token_position: Token position to intervene (-1 for last).
         
         Returns:
-            Generated response string.
+            Generated response string or list of response strings.
         """
         with self.intervene(token_position=token_position):
             responses = self.model.generate(
@@ -231,7 +255,9 @@ class ActivationIntervention:
                 num_return_sequences=1
             )
         
-        return responses[0] if responses else ""
+        if isinstance(prompt, str):
+            return responses[0] if responses else ""
+        return responses
     
     def update_strength(self, new_strength: float):
         """

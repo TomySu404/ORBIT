@@ -14,11 +14,10 @@ whenever v* has non-zero components in masked dimensions.
 Our continuous scaling preserves the direction: cos(v_ours, v*) ≈ 1.
 """
 import torch
-import numpy as np
 from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 
-from ..config import InterventionConfig, LayerScope
+from config import InterventionConfig, LayerScope
 
 
 @dataclass
@@ -48,7 +47,7 @@ class ContinuousDiffCalculator:
     1. No Top-K selection - preserves ALL dimensions
     2. Continuous beta weights based on magnitude
     3. Multiple scaling methods for flexibility
-    4. Layer-wise computation for ablation studies
+    4. Layer-wise computation
     
     Scaling methods:
     - max_norm: β_i = Δh_i / max(|Δh|)  [preserves relative magnitude]
@@ -168,9 +167,7 @@ class ContinuousDiffCalculator:
         """
         Compute activation difference for a single contrastive pair.
         
-        Extracts activations at the last token position for both
-        (question + positive) and (question + negative), then computes
-        the element-wise difference.
+        Uses batch inference to process positive and negative together.
         
         Args:
             question: Input question/prompt.
@@ -179,7 +176,7 @@ class ContinuousDiffCalculator:
             components: Activation components to extract.
         
         Returns:
-            Dictionary mapping layer names to difference tensors.
+            Dictionary mapping layer names to difference tensors [hidden_dim].
         """
         if components is None:
             components = self.config.components
@@ -188,28 +185,76 @@ class ContinuousDiffCalculator:
         pos_text = f"{question}{positive_answer}"
         neg_text = f"{question}{negative_answer}"
         
-        # Get activations for positive (correct) input
-        pos_activations = self.model.get_activations(
-            pos_text,
-            layer_indices=self._layer_indices,
-            components=components,
-            token_position=-1  # Last token
-        )
-        
-        # Get activations for negative (incorrect) input
-        neg_activations = self.model.get_activations(
-            neg_text,
+        # Batch inference: process positive and negative together
+        activations = self.model.get_activations(
+            [pos_text, neg_text],  # Batch of 2
             layer_indices=self._layer_indices,
             components=components,
             token_position=-1
         )
         
         # Compute element-wise difference: positive - negative
+        # activations[name] shape: [2, hidden_dim]
         diff = {}
-        for name in pos_activations:
-            diff[name] = pos_activations[name] - neg_activations[name]
+        for name in activations:
+            diff[name] = activations[name][0] - activations[name][1]
         
         return diff
+    
+    def compute_batch_pair_diffs(
+        self,
+        questions: List[str],
+        positive_answers: List[str],
+        negative_answers: List[str],
+        components: Optional[List[str]] = None
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        Compute activation differences for multiple contrastive pairs in batch.
+        
+        This method processes all pairs in a single forward pass for efficiency.
+        
+        Args:
+            questions: List of input questions/prompts.
+            positive_answers: List of correct answers.
+            negative_answers: List of incorrect answers.
+            components: Activation components to extract.
+        
+        Returns:
+            List of dictionaries, each mapping layer names to diff tensors.
+        """
+        if components is None:
+            components = self.config.components
+        
+        n_pairs = len(questions)
+        if n_pairs == 0:
+            return []
+        
+        # Construct all input texts: [pos1, neg1, pos2, neg2, ...]
+        all_texts = []
+        for q, pos, neg in zip(questions, positive_answers, negative_answers):
+            all_texts.append(f"{q}{pos}")
+            all_texts.append(f"{q}{neg}")
+        
+        # Single batch forward pass
+        activations = self.model.get_activations(
+            all_texts,
+            layer_indices=self._layer_indices,
+            components=components,
+            token_position=-1
+        )
+        
+        # Extract diffs for each pair
+        # activations[name] shape: [2*n_pairs, hidden_dim]
+        all_diffs = []
+        for i in range(n_pairs):
+            pos_idx = 2 * i
+            neg_idx = 2 * i + 1
+            diff = {}
+            for name in activations:
+                diff[name] = activations[name][pos_idx] - activations[name][neg_idx]
+            all_diffs.append(diff)
+        
+        return all_diffs
     
     def aggregate_diffs(
         self,

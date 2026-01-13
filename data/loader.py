@@ -2,7 +2,7 @@
 Dataset loader module.
 
 Provides unified interface for loading various datasets for evaluation.
-Supports: COPA, StoryCloze, SST-2, SST-5, BoolQ, MMLU, XNLI, WinoGrande.
+Supports: COPA, SST-2, SST-5, BoolQ, MMLU, XNLI, WinoGrande, GSM8K.
 """
 import os
 import json
@@ -59,13 +59,13 @@ class DatasetLoader:
         """
         loaders = {
             "copa": self.load_copa,
-            "storycloze": self.load_storycloze,
             "sst2": self.load_sst2,
             "sst5": self.load_sst5,
             "boolq": self.load_boolq,
             "mmlu": self.load_mmlu,
             "xnli": self.load_xnli,
             "winogrande": self.load_winogrande,
+            "gsm8k": self.load_gsm8k,
         }
         
         name = dataset_name.lower()
@@ -87,31 +87,31 @@ class DatasetLoader:
     def load_copa(self) -> Tuple[List[DataSample], List[DataSample]]:
         """Load COPA (Choice of Plausible Alternatives) dataset."""
         train_data, test_data = [], []
-        
+
         # Load training data
         train_path = self.data_root / "xcopa" / "train.csv"
         if train_path.exists():
             with open(train_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()[1:1501]  # Skip header, limit samples
-            
+
             for line in lines:
                 parts = line.strip().split(',')
                 if len(parts) < 6:
                     continue
                 label, premise, question = parts[0].strip(), parts[2].strip(), parts[3].strip()
                 choice1, choice2 = parts[4].strip(), parts[5].strip()
-                
+
                 prompt = (
                     f"Question:\n{premise} Based on the previous passage, "
                     f"choose the most reasonable {question}.\n"
                     f"A:{choice1}\nB:{choice2}\n\nAnswer:\n"
                 )
-                
+
                 if int(label) == 0:
                     train_data.append((prompt, "A", "B"))
                 else:
                     train_data.append((prompt, "B", "A"))
-        
+
         # Load test data
         test_path = self.data_root / "xcopa" / "test.en.jsonl"
         if test_path.exists():
@@ -122,63 +122,20 @@ class DatasetLoader:
                     question = item['question']
                     choice1, choice2 = item['choice1'], item['choice2']
                     label = item['label']
-                    
+
                     prompt = (
                         f"Question:\n{premise} Based on the previous passage, "
                         f"choose the most reasonable {question}.\n"
                         f"A:{choice1}\nB:{choice2}\n\nAnswer:\n"
                     )
-                    
+
                     if int(label) == 0:
                         test_data.append((prompt, "A", "B"))
                     else:
                         test_data.append((prompt, "B", "A"))
-        
+
         return train_data, test_data
-    
-    def load_storycloze(self) -> Tuple[List[DataSample], List[DataSample]]:
-        """Load StoryCloze dataset."""
-        train_data, test_data = [], []
-        
-        def process_line(line: str) -> Optional[DataSample]:
-            parts = line.strip().split('\t')
-            if len(parts) < 8:
-                return None
-            
-            sent1, sent2, sent3, sent4 = parts[1], parts[2], parts[3], parts[4]
-            quiz1, quiz2, label = parts[5], parts[6], parts[7]
-            
-            context = f"{sent1} {sent2} {sent3} {sent4}"
-            prompt = (
-                f"{context}\nQuestion: What is a possible continuation for the story "
-                f"given the following options?\nA: {quiz1} B: {quiz2}\nAnswer:"
-            )
-            
-            if int(label) == 1:
-                return (prompt, "A", "B")
-            else:
-                return (prompt, "B", "A")
-        
-        # Load training data
-        train_path = self.data_root / "xstorycloze" / "spring2016.val.en.tsv.split_20_80_train.tsv"
-        if train_path.exists():
-            with open(train_path, "r", encoding="utf-8") as f:
-                for line in f.readlines()[1:]:  # Skip header
-                    sample = process_line(line)
-                    if sample:
-                        train_data.append(sample)
-        
-        # Load test data
-        test_path = self.data_root / "xstorycloze" / "spring2016.val.en.tsv.split_20_80_eval.tsv"
-        if test_path.exists():
-            with open(test_path, "r", encoding="utf-8") as f:
-                for line in f.readlines()[1:]:
-                    sample = process_line(line)
-                    if sample:
-                        test_data.append(sample)
-        
-        return train_data, test_data
-    
+
     def load_sst2(self) -> Tuple[List[DataSample], List[DataSample]]:
         """Load SST-2 (Stanford Sentiment Treebank - Binary) dataset."""
         train_data, test_data = [], []
@@ -301,11 +258,11 @@ class DatasetLoader:
     
     def load_mmlu(self, subject: str = "all") -> Tuple[List[DataSample], List[DataSample]]:
         """Load MMLU (Massive Multitask Language Understanding) dataset."""
-        train_data, test_data = [], []
+        all_data = []
         
         mmlu_dir = self.data_root / "mmlu" / "test"
         if not mmlu_dir.exists():
-            return train_data, test_data
+            return [], []
         
         def process_row(row: List[str]) -> Optional[DataSample]:
             if len(row) < 6:
@@ -323,13 +280,14 @@ class DatasetLoader:
             )
             
             wrong_choices = ['A', 'B', 'C', 'D']
-            wrong_choices.remove(correct)
+            if correct in wrong_choices:
+                wrong_choices.remove(correct)
             wrong = random.choice(wrong_choices)
             
             return (prompt, correct, wrong)
         
         # Load from all subject files or specific subject
-        for csv_file in mmlu_dir.glob("*.csv"):
+        for csv_file in sorted(mmlu_dir.glob("*.csv")):
             if subject != "all" and subject.lower() not in csv_file.stem.lower():
                 continue
             
@@ -340,11 +298,19 @@ class DatasetLoader:
                         break
                     sample = process_row(row)
                     if sample:
-                        train_data.append(sample)
+                        all_data.append(sample)
         
-        # Use same data for test (MMLU doesn't have separate train/test in this format)
-        test_data = train_data.copy()
-        
+        # Split into train and test to avoid direct overlap
+        if len(all_data) > 200:
+            random.seed(42)
+            random.shuffle(all_data)
+            split_idx = min(len(all_data) // 2, 1000)
+            train_data = all_data[:split_idx]
+            test_data = all_data[split_idx:]
+        else:
+            train_data = all_data
+            test_data = all_data.copy()
+            
         return train_data, test_data
     
     def load_xnli(self) -> Tuple[List[DataSample], List[DataSample]]:
@@ -428,11 +394,57 @@ class DatasetLoader:
                         break
                     train_data.append(process_item(json.loads(line)))
         
-        # Load dev data as test
+        # Load test data (using dev split)
         test_path = self.data_root / "winogrande" / "dev.jsonl"
         if test_path.exists():
             with open(test_path, "r", encoding="utf-8") as f:
                 for line in f:
                     test_data.append(process_item(json.loads(line)))
         
+        return train_data, test_data
+
+    def load_gsm8k(self) -> Tuple[List[DataSample], List[DataSample]]:
+        """Load GSM8K (Grade School Math 8K) dataset."""
+        train_data, test_data = [], []
+        
+        def process_item(item: Dict) -> DataSample:
+            question = item['question'].strip()
+            answer_text = item['answer'].strip()
+
+            # Extract the final numeric answer after ####
+            correct_answer = answer_text.split("####")[-1].strip()
+
+            prompt = (
+                f"Question: {question}\n"
+                f"Solve the math problem and provide the final answer "
+                f"as a number.\nAnswer:"
+            )
+
+            # Generate a simple wrong answer by adding a random offset
+            try:
+                val = int(correct_answer.replace(',', ''))
+                wrong_val = val + random.randint(1, 10)
+                wrong_answer = str(wrong_val)
+            except ValueError:
+                # Fallback if answer is not a simple integer
+                wrong_answer = "0"
+
+            return (prompt, correct_answer, wrong_answer)
+
+        # Load training data
+        train_path = self.data_root / "gsm8k" / "train.jsonl"
+        if train_path.exists():
+            with open(train_path, "r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    if i >= 2000:  # Limit training samples
+                        break
+                    train_data.append(process_item(json.loads(line)))
+
+        # Load test data
+        test_path = self.data_root / "gsm8k" / "test.jsonl"
+        if test_path.exists():
+            with open(test_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    test_data.append(process_item(json.loads(line)))
+
         return train_data, test_data

@@ -6,7 +6,6 @@ ORBIT is a novel activation steering framework designed to improve the behaviora
 
 - **ORC (On-distribution Rollout-based Contrastive pair generation)**: Reduces training-inference distribution shift by using model-generated rollouts.
 - **CSS (Continuous Soft Scaling)**: Replaces discrete binary masking with continuous scaling weights to preserve steering direction.
-- **Structural Layer-wise Ablation**: Flexible intervention across different layer scopes (First N, Last N, or All layers).
 - **Re-read Fallback**: Robust handling of samples where the model fails to generate correct responses naturally.
 
 ---
@@ -66,12 +65,6 @@ pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 python main.py --model meta-llama/Llama-3.1-8B-Instruct --dataset copa --strength 1.2
 ```
 
-### Layer-wise Ablation Study
-To understand which layers contribute most to the behavior:
-```bash
-python main.py --model Qwen/Qwen2.5-7B-Instruct --dataset sst2 --ablation
-```
-
 ### Advanced Configuration
 ```bash
 python main.py \
@@ -87,7 +80,7 @@ python main.py \
 
 ## 📂 Project Structure
 
-- `main.py`: Entry point for experiments and ablation studies.
+- `main.py`: Entry point for experiments.
 - `steering/`: Core implementation of ORBIT algorithms.
     - `rollout.py`: ORC pair generation logic.
     - `diff_vector.py`: CSS weight computation and aggregation.

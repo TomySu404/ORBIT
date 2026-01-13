@@ -10,11 +10,10 @@ Directly patches HuggingFace models without custom implementations.
 """
 import torch
 from torch import nn
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from contextlib import contextmanager
-
-from ..config import ModelType, ExperimentConfig
+from config import ModelType, ExperimentConfig
 
 
 class ModelWrapper:
@@ -90,7 +89,7 @@ class ModelWrapper:
             "bfloat16": torch.bfloat16,
             "float32": torch.float32,
         }
-        self.torch_dtype = dtype_map.get(config.dtype, torch.float16)
+        self.dtype = dtype_map.get(config.dtype, torch.float16)
         
         # Load tokenizer
         print(f"Loading tokenizer: {config.model_name}")
@@ -109,15 +108,20 @@ class ModelWrapper:
         print(f"Loading model: {config.model_name}")
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            torch_dtype=self.torch_dtype,
+            dtype=self.dtype,
             device_map="auto",
             trust_remote_code=True,
         )
         self.model.eval()
-        
+
         # Disable gradient computation globally
         for param in self.model.parameters():
             param.requires_grad = False
+
+        # Get actual device (may be different from config.device when using device_map)
+        # Find the device of the first parameter
+        first_param = next(self.model.parameters())
+        self.device = first_param.device
         
         # Detect model architecture
         self._detect_architecture()
@@ -264,7 +268,7 @@ class ModelWrapper:
     @torch.no_grad()
     def generate(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         max_new_tokens: int = 32,
         temperature: float = 1.0,
         top_p: float = 0.9,
@@ -272,10 +276,10 @@ class ModelWrapper:
         num_return_sequences: int = 1
     ) -> List[str]:
         """
-        Generate responses for a given prompt.
+        Generate responses for a given prompt or batch of prompts.
         
         Args:
-            prompt: Input prompt string.
+            prompt: Input prompt string or list of prompt strings.
             max_new_tokens: Maximum tokens to generate.
             temperature: Sampling temperature (higher = more diverse).
             top_p: Nucleus sampling probability threshold.
@@ -313,6 +317,7 @@ class ModelWrapper:
         outputs = self.model.generate(**inputs, **gen_kwargs)
         
         # Decode and extract only the new tokens (exclude prompt)
+        # Using input_ids.shape[1] is correct because padding is on the left
         prompt_len = inputs["input_ids"].shape[1]
         responses = []
         for output in outputs:
@@ -327,7 +332,7 @@ class ModelWrapper:
     @torch.no_grad()
     def get_activations(
         self,
-        text: str,
+        text: Union[str, List[str]],
         layer_indices: List[int],
         components: List[str] = None,
         token_position: int = -1
@@ -335,33 +340,49 @@ class ModelWrapper:
         """
         Extract activations for specific layers and components.
         
+        Supports both single text and batch of texts.
+        
         Args:
-            text: Input text.
+            text: Input text string or list of text strings.
             layer_indices: Layers to extract from.
             components: Components to extract ('mlp_act', 'attn_out', etc.).
             token_position: Token position to extract (-1 for last token).
+                Note: With left padding, -1 always gets the last real token.
         
         Returns:
-            Dictionary mapping layer names to activation tensors [hidden_dim].
+            Dictionary mapping layer names to activation tensors.
+            - Single input: [hidden_dim]
+            - Batch input: [batch_size, hidden_dim]
         """
         if components is None:
             components = ["mlp_act"]
         
+        # Check if input is a single string or batch
+        is_single = isinstance(text, str)
+        
         inputs = self.tokenizer(
             text,
             return_tensors="pt",
+            padding=True,  # Enable padding for batch support
             truncation=True,
             max_length=2048
         ).to(self.device)
         
         with self.register_hooks(layer_indices, components) as activations:
             self.model(**inputs)
-        
-        # Extract activations at specified token position
-        result = {}
-        for name, act in activations.items():
-            # act shape: [batch, seq_len, hidden_dim]
-            result[name] = act[0, token_position, :].cpu().float()
+            
+            # Extract activations at specified token position
+            # Must extract INSIDE with block before finally clears _activations
+            # Note: With padding_side="left", token_position=-1 is always valid
+            result = {}
+            for name, act in activations.items():
+                # act shape: [batch, seq_len, hidden_dim]
+                if is_single:
+                    # Single input: return [hidden_dim]
+                    result[name] = act[0, token_position, :].cpu().float()
+                else:
+                    # Batch input: return [batch_size, hidden_dim]
+                    result[name] = act[:, token_position, :].cpu().float()
         
         return result
     

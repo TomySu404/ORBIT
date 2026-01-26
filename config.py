@@ -33,6 +33,8 @@ class RolloutConfig:
     top_p: float = 0.9
     max_new_tokens: int = 4
     use_reread_fallback: bool = True
+    format_type: str = "generation"  # "generation" or "chat" - format for prompt construction
+    enable_thinking: bool = False  # Enable thinking tokens in chat template
 
 
 @dataclass
@@ -45,6 +47,8 @@ class InterventionConfig:
     components: List[str] = field(default_factory=lambda: ["mlp_act"])
     prefill_only: bool = True
     custom_layers: Optional[List[int]] = None
+    steering_token_position: int = -1  # Token position for computing steering vectors (-1 for last token)
+    use_grouped_normalization: bool = False  # If True, normalize per-question before global averaging
 
 
 @dataclass

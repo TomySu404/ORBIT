@@ -4,7 +4,9 @@ Evaluation metrics and utilities.
 Provides standardized evaluation functions for comparing model outputs
 against ground truth answers.
 """
-from typing import List, Tuple, Dict, Optional
+import re
+import json
+from typing import List, Tuple, Dict, Optional, Any
 from dataclasses import dataclass, field
 
 
@@ -16,6 +18,44 @@ PUNCTUATION = [
     '&', '^', '%', '$', '#', '@', '~', '`', '|', 
     '<', '>', '=', '+'
 ]
+
+
+def extract_boxed_answer(text: str) -> Optional[str]:
+    """
+    Extract the answer from \\boxed{} format.
+    
+    Supports multiple boxed formats:
+    - \\boxed{answer}
+    - \\boxed:{answer}
+    - boxed{answer}
+    - boxed:{answer}
+    
+    Args:
+        text: Input text that may contain boxed answer.
+    
+    Returns:
+        Extracted answer string if found, None otherwise.
+    """
+    if not text:
+        return None
+    
+    # Pattern to match various boxed formats:
+    # \\boxed{...}, \\boxed:{...}, boxed{...}, boxed:{...}
+    # Also handles nested braces by matching the outermost pair
+    patterns = [
+        r'\\boxed\s*[:\{]\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',  # \\boxed:{...} or \\boxed{{...}}
+        r'\\boxed\s*[:\{]\s*([^{}\s][^{}\n]*)',  # \\boxed:{answer} without braces
+        r'boxed\s*[:\{]\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}',  # boxed:{...}
+        r'boxed\s*[:\{]\s*([^{}\s][^{}\n]*)',  # boxed:{answer} without braces
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            # Return the last match (usually the final answer)
+            return matches[-1].strip()
+    
+    return None
 
 
 def normalize_answer(answer: str) -> str:
@@ -66,9 +106,11 @@ def compute_accuracy(prediction: str, reference: str) -> bool:
     Compute whether prediction matches reference.
     
     Uses flexible matching:
-    1. Exact match after normalization
-    2. Reference contained at start of prediction
-    3. Single-character reference matching
+    1. First check for boxed format and extract answer from it
+    2. Check if reference is contained in the extracted/prediction answer
+    3. Exact match after normalization
+    4. Reference contained at start of prediction
+    5. Single-character reference matching
     
     Args:
         prediction: Model output string.
@@ -77,22 +119,27 @@ def compute_accuracy(prediction: str, reference: str) -> bool:
     Returns:
         True if prediction is considered correct.
     """
-    norm_pred = normalize_answer(prediction)
     norm_ref = normalize_answer(reference)
     
     # Empty reference - cannot match
     if not norm_ref:
         return False
     
+    # Priority 1: Check for boxed format and extract answer
+    boxed_answer = extract_boxed_answer(prediction)
+    if boxed_answer is not None:
+        norm_boxed = normalize_answer(boxed_answer)
+        # Exact match
+        if norm_boxed == norm_ref:
+            return True
+        # For boxed answer, if extraction succeeded but doesn't match, still try fallback
+    
+    # Fallback: Standard matching without boxed extraction
+    norm_pred = normalize_answer(prediction)
+    
     # Exact match
     if norm_pred == norm_ref:
         return True
-    
-    # Reference at start of prediction
-    # Handles cases like "A" matching "a the answer is a"
-    if norm_pred.startswith(norm_ref):
-        return True
-    
     # Single character matching (for A/B/C/D style answers)
     if len(norm_ref) <= 2:
         # Check first characters
@@ -100,6 +147,81 @@ def compute_accuracy(prediction: str, reference: str) -> bool:
             return True
     
     return False
+
+
+def compute_ifeval_accuracy(prediction: str, reference: str) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Compute IFEval accuracy by verifying instruction-following.
+    
+    IFEval requires checking whether the model's response satisfies
+    all verifiable instructions in the prompt (e.g., word count,
+    format requirements, keyword inclusion, etc.).
+    
+    Args:
+        prediction: Model output string.
+        reference: JSON-encoded instruction metadata containing:
+            - instruction_id_list: List of instruction IDs to verify
+            - kwargs: List of parameters for each instruction
+    
+    Returns:
+        Tuple of (is_correct, details) where:
+            - is_correct: True if ALL instructions are satisfied
+            - details: Dict with per-instruction results
+    """
+    try:
+        # Import IFEval verification functions
+        from utils.ifeval_instructions import verify_all_instructions
+        
+        # Parse the reference metadata
+        try:
+            metadata = json.loads(reference)
+        except (json.JSONDecodeError, TypeError):
+            # If not valid JSON or not a string, fall back to standard evaluation
+            return compute_accuracy(prediction, reference), {}
+            
+        # Check if this is an IFEval task
+        if not isinstance(metadata, dict) or metadata.get("task_type") != "ifeval":
+            # Not an IFEval task, fall back to standard evaluation
+            return compute_accuracy(prediction, reference), {}
+        
+        instruction_id_list = metadata.get("instruction_id_list", [])
+        kwargs_list = metadata.get("kwargs", [])
+        
+        # Verify all instructions
+        all_satisfied, results = verify_all_instructions(
+            prediction, instruction_id_list, kwargs_list
+        )
+        
+        return all_satisfied, {
+            "instruction_results": results,
+            "total_instructions": len(instruction_id_list),
+            "satisfied_instructions": sum(results)
+        }
+    
+    except (json.JSONDecodeError, ImportError, AttributeError, TypeError) as e:
+        # If any other error occurs, fall back to standard evaluation
+        return compute_accuracy(prediction, reference), {"error": str(e)}
+
+
+def is_ifeval_reference(reference: str) -> bool:
+    """
+    Check if a reference is IFEval format (JSON with task_type).
+    
+    Args:
+        reference: The reference string to check.
+    
+    Returns:
+        True if reference is IFEval format, False otherwise.
+    """
+    try:
+        if not isinstance(reference, str):
+            return False
+        metadata = json.loads(reference)
+        if not isinstance(metadata, dict):
+            return False
+        return metadata.get("task_type") == "ifeval"
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return False
 
 
 @dataclass
@@ -112,11 +234,13 @@ class EvaluationResult:
         total: Total number of samples.
         correct: Number of correct predictions.
         predictions: List of (prediction, reference, is_correct) tuples.
+        ifeval_metrics: Optional IFEval-specific metrics (only for IFEval tasks).
     """
     accuracy: float = 0.0
     total: int = 0
     correct: int = 0
     predictions: List[Tuple[str, str, bool]] = field(default_factory=list)
+    ifeval_metrics: Optional[Dict[str, Any]] = None
 
 
 class Evaluator:
@@ -127,6 +251,7 @@ class Evaluator:
     - Single sample evaluation
     - Batch evaluation
     - Result aggregation and reporting
+    - IFEval-specific evaluation
     """
     
     def __init__(self, verbose: bool = False):
@@ -144,6 +269,11 @@ class Evaluator:
         self.predictions = []
         self.correct_count = 0
         self.total_count = 0
+        # IFEval-specific tracking
+        self.ifeval_mode = False
+        self.ifeval_instruction_results = []
+        self.ifeval_total_instructions = 0
+        self.ifeval_satisfied_instructions = 0
     
     def evaluate_single(
         self,
@@ -162,6 +292,10 @@ class Evaluator:
         Returns:
             True if prediction is correct.
         """
+        # Check if this is an IFEval evaluation
+        if is_ifeval_reference(reference):
+            return self._evaluate_ifeval_single(prediction, reference, record)
+        
         is_correct = compute_accuracy(prediction, reference)
         
         if record:
@@ -172,7 +306,50 @@ class Evaluator:
         
         if self.verbose:
             status = "✓" if is_correct else "✗"
-            print(f"{status} Pred: '{prediction[:50]}...' | Ref: '{reference}'")
+            # Only truncate and add ellipsis if prediction is longer than 50 chars
+            pred_display = prediction[:128] + "..." if len(prediction) > 50 else prediction
+            print(f"{status} Pred: '{pred_display}' | Ref: '{reference}'")
+        
+        return is_correct
+    
+    def _evaluate_ifeval_single(
+        self,
+        prediction: str,
+        reference: str,
+        record: bool = True
+    ) -> bool:
+        """
+        Evaluate a single IFEval prediction.
+        
+        Args:
+            prediction: Model output.
+            reference: JSON-encoded instruction metadata.
+            record: Whether to record this evaluation.
+        
+        Returns:
+            True if ALL instructions are satisfied.
+        """
+        self.ifeval_mode = True
+        is_correct, details = compute_ifeval_accuracy(prediction, reference)
+        
+        if record:
+            self.predictions.append((prediction, reference, is_correct))
+            self.total_count += 1
+            if is_correct:
+                self.correct_count += 1
+            
+            # Track instruction-level statistics
+            if "instruction_results" in details:
+                self.ifeval_instruction_results.append(details["instruction_results"])
+                self.ifeval_total_instructions += details.get("total_instructions", 0)
+                self.ifeval_satisfied_instructions += details.get("satisfied_instructions", 0)
+        
+        if self.verbose:
+            status = "✓" if is_correct else "✗"
+            pred_display = prediction[:50] + "..." if len(prediction) > 50 else prediction
+            satisfied = details.get("satisfied_instructions", 0)
+            total = details.get("total_instructions", 0)
+            print(f"{status} Pred: '{pred_display}' | Instructions: {satisfied}/{total}")
         
         return is_correct
     
@@ -208,12 +385,28 @@ class Evaluator:
     
     def get_result(self) -> EvaluationResult:
         """Get full evaluation result."""
-        return EvaluationResult(
+        result = EvaluationResult(
             accuracy=self.get_accuracy(),
             total=self.total_count,
             correct=self.correct_count,
             predictions=self.predictions.copy()
         )
+        
+        # Add IFEval-specific metrics if in IFEval mode
+        if self.ifeval_mode:
+            result.ifeval_metrics = {
+                "prompt_strict_accuracy": self.get_accuracy(),  # All instructions satisfied
+                "instruction_accuracy": (
+                    self.ifeval_satisfied_instructions / self.ifeval_total_instructions
+                    if self.ifeval_total_instructions > 0 else 0.0
+                ),
+                "total_prompts": self.total_count,
+                "prompts_all_correct": self.correct_count,
+                "total_instructions": self.ifeval_total_instructions,
+                "satisfied_instructions": self.ifeval_satisfied_instructions
+            }
+        
+        return result
     
     def print_summary(self, name: str = "Evaluation"):
         """Print evaluation summary."""

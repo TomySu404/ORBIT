@@ -14,7 +14,10 @@ from typing import List, Optional
 from dataclasses import dataclass, field
 
 from config import RolloutConfig
-from utils.metrics import compute_accuracy, normalize_answer
+from utils.metrics import (
+    compute_accuracy, compute_ifeval_accuracy,
+    is_ifeval_reference, normalize_answer
+)
 
 
 @dataclass
@@ -87,6 +90,10 @@ class RolloutGenerator:
     
     def _is_correct(self, response: str, reference: str) -> bool:
         """Check correctness using shared utility."""
+        # Check if this is an IFEval task (reference is JSON metadata)
+        if is_ifeval_reference(reference):
+            is_correct, _ = compute_ifeval_accuracy(response, reference)
+            return is_correct
         return compute_accuracy(response, reference)
     
     def _reread_generate(self, question: str, correct_answer: str) -> str:
@@ -110,6 +117,8 @@ class RolloutGenerator:
         """
         # Simply return the correct answer
         # This is marked as "re-read" and will be down-weighted
+        if "\\boxed" in question:
+            correct_answer = "\\boxed{" + correct_answer + "}"
         return correct_answer
     
     def generate_rollouts(self, question: str) -> List[str]:

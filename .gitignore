@@ -1,0 +1,11 @@
+results/
+data/*/
+__pycache__/
+shell/
+experiment.*
+tmp*
+torchel*
+results_models/
+logs/
+analyze/
+.vscode/

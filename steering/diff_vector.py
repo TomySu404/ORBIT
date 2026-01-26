@@ -55,16 +55,20 @@ class ContinuousDiffCalculator:
     - softmax: β_i = softmax(|Δh|)_i * sign(Δh_i) * d  [emphasizes large diffs]
     """
     
-    def __init__(self, model, config: InterventionConfig):
+    def __init__(self, model, config: InterventionConfig, format_type: str = "generation", enable_thinking: bool = False):
         """
         Initialize difference calculator.
-        
+
         Args:
             model: ModelWrapper instance.
             config: Intervention configuration.
+            format_type: Format type for prompt construction ("generation" or "chat").
+            enable_thinking: Whether to enable thinking tokens in chat template.
         """
         self.model = model
         self.config = config
+        self.format_type = format_type
+        self.enable_thinking = enable_thinking
         self._layer_indices = self._compute_layer_indices()
     
     def _compute_layer_indices(self) -> List[int]:
@@ -181,16 +185,16 @@ class ContinuousDiffCalculator:
         if components is None:
             components = self.config.components
         
-        # Construct full input strings
-        pos_text = f"{question}{positive_answer}"
-        neg_text = f"{question}{negative_answer}"
+        # Construct full input strings using format_type
+        pos_text = self.model.format_prompt(question, positive_answer, self.format_type, self.enable_thinking)
+        neg_text = self.model.format_prompt(question, negative_answer, self.format_type, self.enable_thinking)
         
         # Batch inference: process positive and negative together
         activations = self.model.get_activations(
             [pos_text, neg_text],  # Batch of 2
             layer_indices=self._layer_indices,
             components=components,
-            token_position=-1
+            token_position=self.config.steering_token_position
         )
         
         # Compute element-wise difference: positive - negative
@@ -229,18 +233,18 @@ class ContinuousDiffCalculator:
         if n_pairs == 0:
             return []
         
-        # Construct all input texts: [pos1, neg1, pos2, neg2, ...]
+        # Construct all input texts: [pos1, neg1, pos2, neg2, ...] using format_type
         all_texts = []
         for q, pos, neg in zip(questions, positive_answers, negative_answers):
-            all_texts.append(f"{q}{pos}")
-            all_texts.append(f"{q}{neg}")
+            all_texts.append(self.model.format_prompt(q, pos, self.format_type, self.enable_thinking))
+            all_texts.append(self.model.format_prompt(q, neg, self.format_type, self.enable_thinking))
         
         # Single batch forward pass
         activations = self.model.get_activations(
             all_texts,
             layer_indices=self._layer_indices,
             components=components,
-            token_position=-1
+            token_position=self.config.steering_token_position
         )
         
         # Extract diffs for each pair
@@ -292,32 +296,37 @@ class ContinuousDiffCalculator:
         
         # Initialize accumulators
         layer_names = list(all_diffs[0].keys())
-        accumulated = {name: torch.zeros_like(all_diffs[0][name]) for name in layer_names}
-        total_weight = 0.0
-        reread_count = 0
+        n_pairs = len(all_diffs)
+        first_tensor = all_diffs[0][layer_names[0]]
+        device = first_tensor.device
+        dtype = first_tensor.dtype
         
-        # Weighted accumulation
-        for i, diff in enumerate(all_diffs):
-            # Determine weight for this pair
-            if reread_flags and i < len(reread_flags) and reread_flags[i]:
-                weight = reread_weight
-                reread_count += 1
-            else:
-                weight = 1.0
-            
-            # Accumulate weighted difference
-            for name in layer_names:
-                accumulated[name] += weight * diff[name]
-            total_weight += weight
-        
-        # Compute weighted mean
-        if total_weight > 0:
-            mean_diff = {
-                name: accumulated[name] / total_weight
-                for name in layer_names
-            }
+        # Pre-compute weights as a tensor for vectorized operations
+        if reread_flags and len(reread_flags) >= n_pairs:
+            weights = torch.tensor([
+                reread_weight if flag else 1.0 
+                for flag in reread_flags[:n_pairs]
+            ], device=device, dtype=dtype)
+            reread_count = sum(reread_flags[:n_pairs])
         else:
-            mean_diff = accumulated
+            weights = torch.ones(n_pairs, device=device, dtype=dtype)
+            reread_count = 0
+            
+        total_weight = weights.sum().item()
+        
+        # Vectorized aggregation per layer
+        # This replaces the slow nested Python loop with efficient torch operations
+        mean_diff = {}
+        for name in layer_names:
+            # Stack all diffs for this layer: [n_pairs, hidden_dim]
+            layer_tensors = torch.stack([d[name] for d in all_diffs])
+            
+            # Weighted sum: [1, n_pairs] @ [n_pairs, hidden_dim] -> [1, hidden_dim]
+            if total_weight > 0:
+                weighted_sum = (weights.unsqueeze(0) @ layer_tensors).squeeze(0)
+                mean_diff[name] = weighted_sum / total_weight
+            else:
+                mean_diff[name] = torch.zeros_like(layer_tensors[0])
         
         # Compute continuous scaling weights using configured method
         scaling_weights = {
@@ -334,4 +343,96 @@ class ContinuousDiffCalculator:
             sample_count=len(all_diffs),
             pair_count=len(all_diffs),
             reread_sample_count=reread_count
+        )
+    
+    def aggregate_diffs_grouped(
+        self,
+        all_diffs: List[Dict[str, torch.Tensor]],
+        pairs_per_question: List[int],
+        reread_flags: Optional[List[bool]] = None,
+        reread_weight: float = 0.5
+    ) -> DiffVectorResult:
+        """
+        Aggregate difference vectors using per-question normalization before global averaging.
+        
+        This implements a "One Question, One Vote" strategy:
+        1. For each question, compute weighted average of its pairs
+        2. Normalize each question's vector (using configured scaling method)
+        3. Average the normalized vectors across all questions
+        
+        This approach:
+        - Gives equal contribution to each question regardless of pair count
+        - Prevents high-activation samples from dominating the final vector
+        - Better handles datasets with varying sample difficulty/length
+        
+        Args:
+            all_diffs: List of diff dictionaries from compute_pair_diff.
+            pairs_per_question: List of pair counts per question (sum = len(all_diffs)).
+            reread_flags: Optional flags indicating re-read pairs.
+            reread_weight: Weight multiplier for re-read pairs.
+        
+        Returns:
+            DiffVectorResult with grouped-normalized aggregated vectors.
+        """
+        if not all_diffs:
+            raise ValueError("No difference vectors to aggregate")
+        
+        if not pairs_per_question or sum(pairs_per_question) != len(all_diffs):
+            # Fallback to standard aggregation if grouping info is invalid
+            return self.aggregate_diffs(all_diffs, reread_flags, reread_weight)
+        
+        layer_names = list(all_diffs[0].keys())
+        first_tensor = all_diffs[0][layer_names[0]]
+        device = first_tensor.device
+        dtype = first_tensor.dtype
+        
+        # Store normalized vectors for each question
+        question_vectors = {name: [] for name in layer_names}
+        total_reread_count = 0
+        
+        current_idx = 0
+        for num_pairs in pairs_per_question:
+            if num_pairs <= 0:
+                continue
+                
+            # 1. Extract diffs belonging to this question
+            q_diffs = all_diffs[current_idx : current_idx + num_pairs]
+            q_flags = reread_flags[current_idx : current_idx + num_pairs] if reread_flags else None
+            
+            # 2. Compute intra-group weighted average
+            q_result = self.aggregate_diffs(q_diffs, q_flags, reread_weight)
+            total_reread_count += q_result.reread_sample_count
+            
+            # 3. Store the normalized vector (scaling_weights already computed in aggregate_diffs)
+            # The "steering direction" for this question is: diff_vector (already mean)
+            # We then apply the scaling to get a normalized direction
+            for name in layer_names:
+                beta_q = q_result.scaling_weights[name]
+                # Normalized direction vector for this question
+                question_vectors[name].append(beta_q)
+            
+            current_idx += num_pairs
+        
+        # 4. Global average across all questions (equal weight per question)
+        final_diff_vectors = {}
+        for name in layer_names:
+            if question_vectors[name]:
+                stacked = torch.stack(question_vectors[name])
+                final_diff_vectors[name] = stacked.mean(dim=0)
+            else:
+                final_diff_vectors[name] = torch.zeros_like(first_tensor)
+        
+        # 5. Since we already applied scaling per-question, set final scaling_weights to ones
+        # This ensures that during intervention: h' = h + alpha * (1.0) * final_diff
+        # The direction is already "baked in" from per-question normalization
+        final_scaling_weights = {
+            name: torch.ones_like(v) for name, v in final_diff_vectors.items()
+        }
+        
+        return DiffVectorResult(
+            diff_vectors=final_diff_vectors,
+            scaling_weights=final_scaling_weights,
+            sample_count=len(pairs_per_question),
+            pair_count=len(all_diffs),
+            reread_sample_count=total_reread_count
         )

@@ -9,6 +9,7 @@ This module provides a clean abstraction layer for:
 Directly patches HuggingFace models without custom implementations.
 """
 import torch
+import torch.distributed as dist
 from torch import nn
 from typing import Dict, List, Optional, Any, Callable, Union
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -92,7 +93,10 @@ class ModelWrapper:
         self.dtype = dtype_map.get(config.dtype, torch.float16)
         
         # Load tokenizer
-        print(f"Loading tokenizer: {config.model_name}")
+        # Only print on rank 0 in distributed mode
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            print(f"Loading tokenizer: {config.model_name}", flush=True)
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
             trust_remote_code=True,
@@ -105,11 +109,16 @@ class ModelWrapper:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         
         # Load model
-        print(f"Loading model: {config.model_name}")
+        if rank == 0:
+            print(f"Loading model: {config.model_name}", flush=True)
+        if dist.is_initialized():
+            device_map = f"cuda:{dist.get_rank()}"
+        else:
+            device_map = "auto"
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             dtype=self.dtype,
-            device_map="auto",
+            device_map=device_map,
             trust_remote_code=True,
         )
         self.model.eval()
@@ -129,7 +138,8 @@ class ModelWrapper:
         # Storage for hook activations
         self._activations: Dict[str, torch.Tensor] = {}
         
-        print(f"Model loaded: {self.model_type.value}, {self.num_layers} layers")
+        if rank == 0:
+            print(f"Model loaded: {self.model_type.value}, {self.num_layers} layers", flush=True)
     
     def _detect_architecture(self):
         """Auto-detect model architecture and number of layers."""
@@ -169,6 +179,40 @@ class ModelWrapper:
         # Set layer pattern
         self.layer_pattern = self.LAYER_PATTERNS[self.model_type]
     
+    def format_prompt(self, question: str, answer: str, format_type: str = "generation", enable_thinking: bool = False) -> str:
+        """
+        Format prompt based on format type.
+
+        Args:
+            question: Input question/prompt.
+            answer: Answer to append.
+            format_type: "generation" for simple concatenation, "chat" for chat template.
+            enable_thinking: Whether to enable thinking tokens in chat template.
+
+        Returns:
+            Formatted text string.
+        """
+        if format_type == "chat":
+            # Use chat template if available
+            if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template is not None:
+                messages = [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer} if answer else None
+                ]
+                formatted = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=enable_thinking
+                )
+                return formatted
+            else:
+                # Fallback: use generation format if chat template not available
+                return f"{question}{answer}" if answer else question
+        else:
+            # Generation format: simple concatenation
+            return f"{question}{answer}" if answer else question
+    
     def get_layer_name(self, layer_idx: int, component: str) -> str:
         """
         Get the full module path for a specific layer component.
@@ -202,21 +246,35 @@ class ModelWrapper:
                 module = getattr(module, part)
         return module
     
+    @staticmethod
+    def _activation_hook(module: nn.Module, input: Any, output: Any, activations_dict: Dict[str, torch.Tensor], name: str):
+        """
+        Static hook function for storing activations. This can be pickled unlike closures.
+
+        Args:
+            module: The hooked module
+            input: Input to the module
+            output: Output from the module
+            activations_dict: Dictionary to store activations in
+            name: Key to store activation under
+        """
+        # Handle tuple outputs (some layers return tuples)
+        out = output[0] if isinstance(output, tuple) else output
+        activations_dict[name] = out.detach()
+
     def _make_hook(self, name: str) -> Callable:
         """
         Create a forward hook function that stores activations.
-        
+
         Args:
             name: Key to store activation under.
-        
+
         Returns:
             Hook function.
         """
-        def hook(module: nn.Module, input: Any, output: Any):
-            # Handle tuple outputs (some layers return tuples)
-            out = output[0] if isinstance(output, tuple) else output
-            self._activations[name] = out.detach()
-        return hook
+        # Use functools.partial to bind parameters without creating a closure
+        from functools import partial
+        return partial(self._activation_hook, activations_dict=self._activations, name=name)
     
     @contextmanager
     def register_hooks(
@@ -289,6 +347,10 @@ class ModelWrapper:
         Returns:
             List of generated response strings (prompt excluded).
         """
+        if isinstance(prompt, str):
+            prompt = self.format_prompt(prompt,None, self.config.rollout.format_type, self.config.rollout.enable_thinking)
+        else:
+            prompt = [self.format_prompt(p,None, self.config.rollout.format_type, self.config.rollout.enable_thinking) for p in prompt]
         inputs = self.tokenizer(
             prompt,
             return_tensors="pt",
@@ -377,12 +439,22 @@ class ModelWrapper:
             result = {}
             for name, act in activations.items():
                 # act shape: [batch, seq_len, hidden_dim]
+                seq_len = act.shape[1]
+                
+                # Handle token_position: clamp to valid range if out of bounds
+                if token_position < 0:
+                    # Negative indexing (e.g., -1 for last token)
+                    actual_pos = token_position
+                else:
+                    # Positive indexing: clamp to last token if out of bounds
+                    actual_pos = min(token_position, seq_len - 1)
+                
                 if is_single:
                     # Single input: return [hidden_dim]
-                    result[name] = act[0, token_position, :].cpu().float()
+                    result[name] = act[0, actual_pos, :].cpu().float()
                 else:
                     # Batch input: return [batch_size, hidden_dim]
-                    result[name] = act[:, token_position, :].cpu().float()
+                    result[name] = act[:, actual_pos, :].cpu().float()
         
         return result
     

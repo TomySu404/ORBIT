@@ -76,6 +76,18 @@ python main.py \
     --reread_weight 0.3
 ```
 
+### SADI-Style Dynamic Intervention
+```bash
+python main.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --dataset copa \
+    --sadi \
+    --sadi_pairs \
+    --sadi_topk 512 \
+    --sadi_selection abs \
+    --strength 20
+```
+
 ---
 
 ## 📂 Project Structure

@@ -58,6 +58,8 @@ class ActivationIntervention:
         
         # Pre-compute intervention vectors for efficiency
         self._intervention_vectors = self._precompute_interventions()
+        # SADI
+        self._sadi_masks = self._precompute_sadi_masks() if self.config.use_sadi else None
         
         # Track initial sequence length for prefill-only intervention
         self._initial_seq_len = None
@@ -90,6 +92,78 @@ class ActivationIntervention:
             interventions[name] = intervention.to(self.model.device)
         
         return interventions
+
+    # SADI
+    def _precompute_sadi_masks(self) -> Dict[str, torch.Tensor]:
+        """
+        Pre-compute SADI masks from diff vectors.
+
+        Uses top-K selection on diff vectors per layer/component to identify
+        critical dimensions for dynamic scaling during inference.
+        """
+        masks = {}
+        topk = self.config.sadi_topk
+        selection = self.config.sadi_selection
+        scope = getattr(self.config, "sadi_mask_scope", "per_layer")  # 新增，默认 per_layer
+
+        if scope == "global" and topk:
+            # 1) 先收集每个 name 的 scores（但不马上 topK）
+            scored = {}
+            shapes = {}
+            numels = {}
+            for name, diff_vec in self.diff_result.diff_vectors.items():
+                if selection == "abs":
+                    scores = torch.abs(diff_vec)
+                elif selection == "pos":
+                    scores = diff_vec
+                elif selection == "neg":
+                    scores = -diff_vec
+                else:
+                    scores = diff_vec
+
+                scored[name] = scores
+                shapes[name] = scores.shape
+                numels[name] = scores.numel()
+
+            # 2) concat 全部 scores -> 全局 topK
+            all_flat = torch.cat([scored[name].reshape(-1) for name in scored.keys()], dim=0)
+            K = min(topk, all_flat.numel())
+            _, topk_idx = torch.topk(all_flat, k=K)
+
+            global_mask = torch.zeros_like(all_flat)
+            global_mask[topk_idx] = 1.0
+
+            # 3) split 回每个 name 的 mask
+            offset = 0
+            for name in scored.keys():
+                n = numels[name]
+                m = global_mask[offset:offset + n].view(shapes[name])
+                masks[name] = m.to(self.model.device)
+                offset += n
+
+            return masks
+
+        for name, diff_vec in self.diff_result.diff_vectors.items():
+            scores = diff_vec
+            if selection == "abs":
+                scores = torch.abs(diff_vec)
+            elif selection == "pos":
+                scores = diff_vec
+            elif selection == "neg":
+                scores = -diff_vec
+
+            if topk and topk < scores.numel():
+                flat_scores = scores.view(-1)
+                _, topk_idx = torch.topk(flat_scores, k=topk)
+                mask = torch.zeros_like(flat_scores)
+                mask[topk_idx] = 1.0
+                mask = mask.view_as(scores)
+            else:
+                mask = torch.ones_like(scores)
+
+            masks[name] = mask.to(self.model.device)
+
+        return masks
     
     def _get_module(self, name: str) -> nn.Module:
         """
@@ -178,6 +252,58 @@ class ActivationIntervention:
             return (hidden,) + rest
         return hidden
 
+    # SADI
+    @staticmethod
+    def _sadi_intervention_hook(
+        module: nn.Module,
+        input,
+        output,
+        mask: torch.Tensor,
+        strength: float,
+        config_prefill_only: bool,
+        initial_seq_len_ref: List,
+        token_position: int = -1
+    ):
+        """
+        SADI-style dynamic scaling hook.
+
+        Scales selected dimensions of the current activation (dynamic)
+        instead of adding a fixed steering vector.
+        """
+        if isinstance(output, tuple):
+            hidden = output[0]
+            rest = output[1:]
+            is_tuple = True
+        else:
+            hidden = output
+            rest = None
+            is_tuple = False
+
+        current_seq_len = hidden.shape[1]
+        if config_prefill_only:
+            if initial_seq_len_ref[0] is None:
+                initial_seq_len_ref[0] = current_seq_len
+            if current_seq_len != initial_seq_len_ref[0]:
+                if is_tuple:
+                    return (hidden,) + rest
+                return hidden
+
+        mask = mask.to(hidden.device).to(hidden.dtype)
+        # scale = 1.0 + strength * mask
+        scale = 1.0 + (strength - 1.0) * mask
+
+        hidden = hidden.clone()
+        if token_position == -1:
+            hidden[:, -1, :] = hidden[:, -1, :] * scale
+        elif token_position >= 0:
+            hidden[:, token_position, :] = hidden[:, token_position, :] * scale
+        else:
+            hidden[:, token_position, :] = hidden[:, token_position, :] * scale
+
+        if is_tuple:
+            return (hidden,) + rest
+        return hidden
+
     def _create_intervention_hook(
         self,
         layer_name: str,
@@ -202,6 +328,18 @@ class ActivationIntervention:
 
         # Sync the reference with current state
         self._initial_seq_len_ref[0] = self._initial_seq_len
+
+        # SADI
+        if self.config.use_sadi:
+            mask = self._sadi_masks[layer_name]
+            return partial(
+                self._sadi_intervention_hook,
+                mask=mask,
+                strength=self.config.intervention_strength,
+                config_prefill_only=self.config.prefill_only,
+                initial_seq_len_ref=self._initial_seq_len_ref,
+                token_position=token_position
+            )
 
         return partial(
             self._intervention_hook,

@@ -34,7 +34,8 @@ class DatasetLoader:
     - Consistent evaluation
     """
 
-    def __init__(self, data_root: str = "./data"):
+    # def __init__(self, data_root: str = "./data"):
+    def __init__(self, data_root: str = "/data1/hao.luo/project/steering_vectors/data"):
         """
         Initialize dataset loader.
 

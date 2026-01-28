@@ -27,6 +27,7 @@ import numpy as np
 import itertools
 import os
 import traceback
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from tqdm import tqdm
@@ -43,6 +44,8 @@ from steering.diff_vector import ContinuousDiffCalculator, DiffVectorResult
 from steering.intervention import ActivationIntervention
 from data.loader import DatasetLoader
 from utils.metrics import Evaluator, EvaluationResult
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 
 def serialize_steering_vectors(steering_data: Dict) -> Dict:
     """
@@ -399,16 +402,28 @@ def tune_hyperparameters(
     # In distributed mode, each process already has the model loaded, so we can use multi-GPU
     print_rank0("\n📊 Pre-computing steering vectors (shared across all configs)...")
     max_train_samples = min(args.max_train or 100, args.max_tune_samples)
-    steering_data = build_steering_vectors(
-        model, train_data,
-        rollout_config, intervention_config,  # Use base config for diff_vector computation
-        reread_weight=args.reread_weight,
-        max_samples=max_train_samples,
-        show_progress=True,
-        diff_batch_size=args.diff_batch_size,
-        format_type=args.format_type,
-        num_gpus=num_gpus  # Use multi-GPU in distributed mode
-    )
+    if args.sadi and args.sadi_pairs:
+        steering_data = build_sadi_vectors_from_pairs(
+            model, train_data,
+            intervention_config,
+            max_samples=max_train_samples,
+            show_progress=True,
+            diff_batch_size=args.diff_batch_size,
+            format_type=args.format_type,
+            enable_thinking=rollout_config.enable_thinking,
+            num_gpus=num_gpus
+        )
+    else:
+        steering_data = build_steering_vectors(
+            model, train_data,
+            rollout_config, intervention_config,  # Use base config for diff_vector computation
+            reread_weight=args.reread_weight,
+            max_samples=max_train_samples,
+            show_progress=True,
+            diff_batch_size=args.diff_batch_size,
+            format_type=args.format_type,
+            num_gpus=num_gpus  # Use multi-GPU in distributed mode
+        )
     
     best_score = 0.0
     best_config = None
@@ -591,6 +606,208 @@ def build_steering_vectors(
 
     # Return local result for non-main processes (though it won't be used)
     return local_result
+
+
+def build_sadi_vectors_from_pairs(
+    model: ModelWrapper,
+    train_data: List[Tuple[str, str, str]],
+    intervention_config: InterventionConfig,
+    max_samples: int = 150,
+    show_progress: bool = True,
+    diff_batch_size: int = 16,
+    format_type: str = "generation",
+    enable_thinking: bool = False,
+    num_gpus: int = 1
+) -> Dict:
+    """
+    Build SADI-style steering vectors directly from dataset (gold) pairs.
+    """
+    world_size = get_world_size()
+    rank = get_rank()
+
+    # Use distributed if available, otherwise fall back to single GPU
+    use_distributed = world_size > 1 and num_gpus > 1
+
+    if not use_distributed:
+        return _build_sadi_vectors_single_gpu(
+            model, train_data, intervention_config,
+            max_samples=max_samples,
+            show_progress=show_progress,
+            diff_batch_size=diff_batch_size,
+            format_type=format_type,
+            enable_thinking=enable_thinking
+        )
+
+    print_rank0(f"🔥 Using {world_size} GPUs for SADI pair diffs")
+
+    samples = train_data[:max_samples] if max_samples else train_data
+    print_rank0(f"Total training samples: {len(samples)}")
+
+    if len(samples) < world_size:
+        print_rank0(f"Too few samples ({len(samples)}) for {world_size} GPUs, falling back to single GPU")
+        return _build_sadi_vectors_single_gpu(
+            model, train_data, intervention_config,
+            max_samples=max_samples,
+            show_progress=show_progress,
+            diff_batch_size=diff_batch_size,
+            format_type=format_type,
+            enable_thinking=enable_thinking
+        )
+
+    # Distribute data across ranks
+    chunk_size = len(samples) // world_size
+    start_idx = rank * chunk_size
+    end_idx = (rank + 1) * chunk_size if rank < world_size - 1 else len(samples)
+    local_chunk = samples[start_idx:end_idx]
+
+    print(f"[rank{rank}] {len(local_chunk)} samples (indices {start_idx}:{end_idx})")
+
+    local_result = None
+    try:
+        local_result = _build_sadi_vectors_single_gpu(
+            model, local_chunk, intervention_config,
+            max_samples=None,
+            show_progress=show_progress and is_main_process(),
+            diff_batch_size=diff_batch_size,
+            format_type=format_type,
+            enable_thinking=enable_thinking
+        )
+
+        local_result_for_gather = dict(local_result)
+        local_result_for_gather["diff_result"] = _diff_result_to_cpu(local_result["diff_result"])
+        payload = {"ok": True, "rank": rank, "result": local_result_for_gather}
+    except Exception as e:
+        payload = {
+            "ok": False,
+            "rank": rank,
+            "error": repr(e),
+            "traceback": traceback.format_exc()
+        }
+
+    gathered = _gather_results_all_ranks(payload, world_size)
+
+    has_error = any((p is None) or (not p.get("ok", False)) for p in gathered)
+    if has_error:
+        if is_main_process():
+            for p in gathered:
+                if p is None or p.get("ok", False):
+                    continue
+                print_rank0(f"[rank{p.get('rank')}] build_sadi_vectors_from_pairs failed: {p.get('error')}")
+                print_rank0(p.get("traceback", ""))
+        raise RuntimeError("Distributed build_sadi_vectors_from_pairs failed on at least one rank. See rank0 logs.")
+
+    if is_main_process():
+        result_list = [p["result"] for p in gathered]
+        merged_result = _merge_steering_results(result_list, intervention_config)
+        return merged_result
+
+    return local_result
+
+
+def _build_sadi_vectors_single_gpu(
+    model_or_config,
+    train_data: List[Tuple[str, str, str]],
+    intervention_config: InterventionConfig,
+    max_samples: int = 150,
+    show_progress: bool = True,
+    diff_batch_size: int = 16,
+    format_type: str = "generation",
+    enable_thinking: bool = False
+) -> Dict:
+    """Single GPU version of build_sadi_vectors_from_pairs."""
+    if isinstance(model_or_config, ModelWrapper):
+        model = model_or_config
+    else:
+        model = ModelWrapper(model_or_config)
+
+    diff_calc = ContinuousDiffCalculator(
+        model, intervention_config, format_type=format_type, enable_thinking=enable_thinking
+    )
+
+    samples = train_data[:max_samples] if max_samples else train_data
+    if not samples:
+        raise RuntimeError("No training samples available for SADI pair diffs.")
+
+    stats = {
+        "total_samples": len(samples),
+        "samples_with_rollout_correct": 0,
+        "samples_with_reread": 0,
+        "total_pairs": 0,
+        "reread_pairs": 0,
+        "skipped_samples": 0
+    }
+
+    all_diffs = []
+    reread_flags = []
+    pairs_per_question = []
+
+    num_batches = (len(samples) + diff_batch_size - 1) // diff_batch_size
+    iterator = range(0, len(samples), diff_batch_size)
+    if show_progress:
+        iterator = tqdm_rank0(iterator, total=num_batches, desc="Computing diffs (SADI pairs)")
+
+    for i in iterator:
+        batch = samples[i:i + diff_batch_size]
+        questions = [s[0] for s in batch]
+        positives = [s[1] for s in batch]
+        negatives = [s[2] for s in batch]
+        try:
+            batch_diffs = diff_calc.compute_batch_pair_diffs(
+                questions, positives, negatives,
+                components=intervention_config.components
+            )
+            all_diffs.extend(batch_diffs)
+            reread_flags.extend([False] * len(batch_diffs))
+            pairs_per_question.extend([1] * len(batch_diffs))
+        except Exception as e:
+            if show_progress:
+                print_rank0(f"Warning: SADI batch diff failed: {e}")
+            for q, pos, neg in zip(questions, positives, negatives):
+                try:
+                    diff = diff_calc.compute_pair_diff(
+                        q, pos, neg,
+                        components=intervention_config.components
+                    )
+                    all_diffs.append(diff)
+                    reread_flags.append(False)
+                    pairs_per_question.append(1)
+                except Exception as e2:
+                    if show_progress:
+                        print_rank0(f"Warning: SADI single diff failed: {e2}")
+                    stats["skipped_samples"] += 1
+                    pairs_per_question.append(0)
+
+    if not all_diffs:
+        raise RuntimeError("No valid SADI diffs computed. Check your data and model.")
+
+    stats["total_pairs"] = len(all_diffs)
+
+    if intervention_config.use_grouped_normalization:
+        diff_result = diff_calc.aggregate_diffs_grouped(
+            all_diffs,
+            pairs_per_question,
+            reread_flags,
+            reread_weight=1.0
+        )
+        print_rank0("   Using grouped normalization (per-question normalization)")
+    else:
+        diff_result = diff_calc.aggregate_diffs(
+            all_diffs,
+            reread_flags,
+            reread_weight=1.0
+        )
+
+    print_rank0("\n📊 SADI Pair Steering Vector Statistics:")
+    print_rank0(f"   Total samples processed: {stats['total_samples']}")
+    print_rank0(f"   Skipped samples: {stats['skipped_samples']}")
+    print_rank0(f"   Total pairs: {stats['total_pairs']}")
+    print_rank0(f"   Layers intervened: {diff_calc.layer_indices}")
+
+    return {
+        "diff_result": diff_result,
+        "stats": stats,
+        "layer_indices": diff_calc.layer_indices
+    }
 
 
 def _build_steering_vectors_single_gpu(
@@ -1082,6 +1299,33 @@ def main():
         "--grouped_normalization", action="store_true",
         help="Use per-question normalization before global averaging (One Question One Vote strategy)"
     )
+    # SADI
+    parser.add_argument(
+        "--sadi", action="store_true",
+        help="Enable SADI-style dynamic scaling intervention"
+    )
+    parser.add_argument(
+        "--sadi_topk", type=int,
+        default=0,
+        help="Top-K dimensions per layer for SADI mask (0 = all dims)"
+    )
+    parser.add_argument(
+        "--sadi_selection", type=str,
+        default="abs",
+        choices=["abs", "pos", "neg"],
+        help="SADI mask selection based on diff vectors: abs/pos/neg"
+    )
+    parser.add_argument(
+        "--sadi_mask_scope", type=str,
+        default="per_layer",
+        choices=["per_layer", "global"],
+        help="SADI mask selection based on mask: per_layer/global"
+    )
+    parser.add_argument(
+        "--sadi_pairs", action="store_true",
+        help="Use dataset gold pairs (question, correct, wrong) for SADI instead of rollouts"
+    )
+
     args = parser.parse_args()
     
     # Initialize distributed training if enabled
@@ -1141,7 +1385,12 @@ def main():
         components=args.components.split(","),
         prefill_only=args.prefill_only,
         steering_token_position=args.steering_token_position,
-        use_grouped_normalization=args.grouped_normalization
+        use_grouped_normalization=args.grouped_normalization,
+        # SADI
+        use_sadi=args.sadi,
+        sadi_topk=args.sadi_topk,
+        sadi_selection=args.sadi_selection,
+        sadi_mask_scope=args.sadi_mask_scope
     )
     try:
         for data in args.datasets:
@@ -1163,6 +1412,13 @@ def main():
             print_rank0(f"Format type: {args.format_type}")
             print_rank0(f"Steering token position: {args.steering_token_position}")
             print_rank0(f"Grouped normalization: {'enabled' if args.grouped_normalization else 'disabled'}")
+            # SADI
+            if args.sadi:
+                print_rank0(f"SADI: enabled (topk={args.sadi_topk}, selection={args.sadi_selection})")
+                print_rank0(f"SADI pairs: {'enabled (gold pairs)' if args.sadi_pairs else 'disabled (use rollouts)'}")
+            else:
+                print_rank0("SADI: disabled")
+                
             print_rank0(f"Seeds: {args.seeds}")
             print_rank0("="*60 + "\n")
             # Load model once (each process loads its own copy)
@@ -1276,16 +1532,28 @@ def main():
                 steering_data = tune_steering_data
             else:
                 print_rank0("\n🔧 Building Steering Vectors...")
-                steering_data = build_steering_vectors(
-                    model, train_data,
-                    rollout_config, current_intervention_config,
-                    reread_weight=args.reread_weight,
-                    max_samples=args.max_train,
-                    diff_batch_size=args.diff_batch_size,
-                    show_progress=True,
-                    format_type=args.format_type,
-                    num_gpus=num_available_gpus
-                )
+                if args.sadi and args.sadi_pairs:
+                    steering_data = build_sadi_vectors_from_pairs(
+                        model, train_data,
+                        current_intervention_config,
+                        max_samples=args.max_train,
+                        diff_batch_size=args.diff_batch_size,
+                        show_progress=True,
+                        format_type=args.format_type,
+                        enable_thinking=rollout_config.enable_thinking,
+                        num_gpus=num_available_gpus
+                    )
+                else:
+                    steering_data = build_steering_vectors(
+                        model, train_data,
+                        rollout_config, current_intervention_config,
+                        reread_weight=args.reread_weight,
+                        max_samples=args.max_train,
+                        diff_batch_size=args.diff_batch_size,
+                        show_progress=True,
+                        format_type=args.format_type,
+                        num_gpus=num_available_gpus
+                    )
             intervention = ActivationIntervention(
                 model, current_intervention_config, steering_data["diff_result"]
             )
@@ -1377,7 +1645,12 @@ def main():
                 "grouped_normalization": args.grouped_normalization,
                 "seeds": args.seeds,
                 "components": current_intervention_config.components,
-                "prefill_only": args.prefill_only
+                "prefill_only": args.prefill_only,
+                "sadi": args.sadi,
+                "sadi_topk": args.sadi_topk,
+                "sadi_selection": args.sadi_selection,
+                "sadi_mask_scope": args.sadi_mask_scope,
+                "sadi_pairs": args.sadi_pairs
             },
             "stats": {
                 "mean_accuracy": mean_acc,
@@ -1401,4 +1674,31 @@ def main():
             cleanup_distributed()
         
 if __name__ == "__main__":
+    sys.argv = [
+        sys.argv[0],
+        "--model", "/data2/models/Qwen3-0.6B",
+        "--dataset", "sst2",
+        "--data_root", "/data1/hao.luo/project/steering_vectors/data",
+        "--batch_size", "32",
+        "--max_train", "100",
+        "--num_rollouts", "32",
+        "--max_new_tokens", "128",
+        "--components", "attn",
+        "--layer_scope", "all",
+        "--scaling", "max_norm",
+        "--num_layers", "5",
+        "--max_tune_samples", "1000",
+        "--strength", "6",
+        "--tune_hyperparams",
+        "--grouped_normalization",
+        "--prefill_only",
+        "--output_dir", "./results_models",
+        "--format_type", "chat",
+        "--parallel_gpus",
+        "--seeds", "42", "52",
+        "--sadi",
+        "--sadi_topk", "5",
+        "--sadi_selection", "pos",
+        "--sadi_mask_scope", "global",
+    ]
     main()

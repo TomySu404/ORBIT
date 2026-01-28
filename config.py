@@ -49,6 +49,11 @@ class InterventionConfig:
     custom_layers: Optional[List[int]] = None
     steering_token_position: int = -1  # Token position for computing steering vectors (-1 for last token)
     use_grouped_normalization: bool = False  # If True, normalize per-question before global averaging
+    # SADI
+    use_sadi: bool = False  # Enable SADI-style dynamic scaling intervention
+    sadi_topk: int = 0  # Top-K dims per layer (0 = all dims)
+    sadi_selection: str = "abs"  # "abs", "pos", "neg"
+    sadi_mask_scope: str = "per_layer"  # "per_layer" or "global"
 
 
 @dataclass

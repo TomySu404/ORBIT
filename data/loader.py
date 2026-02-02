@@ -34,14 +34,16 @@ class DatasetLoader:
     - Consistent evaluation
     """
 
-    def __init__(self, data_root: str = "./data"):
+    def __init__(self, data_root: str = "./data", model_name: str = ""):
         """
         Initialize dataset loader.
 
         Args:
             data_root: Root directory containing dataset folders.
+            model_name: Name/path of the model (used for prompt format selection).
         """
         self.data_root = Path(data_root)
+        self.model_name = model_name.lower() if model_name else ""
 
         # Spider-specific attributes
         self.spider_dir = self.data_root.parent / "shell" / "spider"
@@ -147,7 +149,7 @@ class DatasetLoader:
                     label = item['label']
 
                     prompt = (
-                        f"Question:\n{premise} Based on the previous passage, "
+                        f"Question:\n{premise} Based on the previous passage"
                         f"choose the most reasonable {question}.\n"
                         f"A:{choice1}\nB:{choice2}\n\nAnswer:\n"
                     )
@@ -207,20 +209,31 @@ class DatasetLoader:
             'neutral': None  # Random choice
         }
         
+        # Check if model is Qwen to determine prompt format
+        is_qwen = 'qwen' in self.model_name.lower()
         def process_item(item: Dict) -> DataSample:
             text = item['text'].strip()
             label = item['label_text'].strip()
             
-            prompt = (
-                "You are given a sentence.\n"
-                "Determine the sentiment of the sentence.\n\n"
-                "Rules:\n"
-                "1. Choose exactly one label from: very positive, positive, neutral, negative, very negative.\n"
-                "2. Do not add any extra text in the final answer.\n"
-                "3. Put the final answer inside \\boxed{{}}.\n\n"
-                f"Sentence: {text}\n\n"
-                "Final Answer:"
-            )
+            if is_qwen:
+                # Use boxed format for Qwen models
+                prompt = (
+                    "You are given a sentence.\n"
+                    "Determine the sentiment of the sentence.\n\n"
+                    "Rules:\n"
+                    "1. Choose exactly one label from: very positive, positive, neutral, negative, very negative.\n"
+                    "2. Do not add any extra text in the final answer.\n"
+                    "3. Put the final answer inside \\boxed{{}}.\n\n"
+                    f"Sentence: {text}\n\n"
+                    "Final Answer:"
+                )
+            else:
+                # Use simple format for other models
+                prompt = (
+                    f"Question:\nDetermine the sentiment of the following sentence. "
+                    f"Choose one label from: very positive, positive, neutral, negative, very negative.\n"
+                    f"Sentence: {text}\n\nAnswer:\n"
+                )
             
             wrong = opposite_map.get(label)
             if wrong is None:
@@ -360,20 +373,29 @@ class DatasetLoader:
             
             if lang != 'en':
                 return None
-            
-            prompt = (
-                "You are given a premise and a hypothesis.\n"
-                "Determine whether the hypothesis is **more likely to be true, "
-                "false, or inconclusive** based only on the information in the "
-                "premise.\n\n"
-                "Rules:\n"
-                "1. Choose exactly one label from: True, False, Inconclusive.\n"
-                "2. Do not add any extra text in the final answer.\n"
-                "3. Put the final answer inside \\boxed{{}}.\n\n"
-                f"Premise: {premise}\n"
-                f"Hypothesis: {hypothesis}\n\n"
-                "Final Answer:"
-            )
+            if 'qwen' in self.model_name.lower():
+                prompt = (
+                    "You are given a premise and a hypothesis.\n"
+                    "Determine whether the hypothesis is **more likely to be true, "
+                    "false, or inconclusive** based only on the information in the "
+                    "premise.\n\n"
+                    "Rules:\n"
+                    "1. Choose exactly one label from: True, False, Inconclusive.\n"
+                    "2. Do not add any extra text in the final answer.\n"
+                    "3. Put the final answer inside \\boxed{{}}.\n\n"
+                    f"Premise: {premise}\n"
+                    f"Hypothesis: {hypothesis}\n\n"
+                    "Final Answer:"
+                )
+            else:
+                prompt = (
+                    f"Question:\nDetermine whether the hypothesis is **more likely to be true, "
+                    f"false, or inconclusive** based only on the information in the "
+                    f"premise.\n\n"
+                    f"Premise: {premise}\n"
+                    f"Hypothesis: {hypothesis}\n\n"
+                    f"Answer:"
+                )
             
             if label in label_map:
                 correct, wrong_options = label_map[label]
@@ -597,15 +619,25 @@ class DatasetLoader:
             wrong_choices = ['A', 'B', 'C', 'D']
             wrong_choices.remove(correct_letter)
             wrong_letter = random.choice(wrong_choices)
-            
-            # Build prompt similar to MMLU format
-            prompt = (
-                f"Question: {question}\n"
-                f"Which of the following answers is correct?\n"
-                f"A. {all_options[0]}\nB. {all_options[1]}\n"
-                f"C. {all_options[2]}\nD. {all_options[3]}\n"
-                f"State the letter corresponding to the correct answer.\nAnswer:"
-            )
+            if 'qwen' in self.model_name.lower():
+                prompt = (
+                    f"Question: {question}\n"
+                    f"Which of the following answers is correct?\n"
+                    f"A. {all_options[0]}\nB. {all_options[1]}\n"
+                    f"C. {all_options[2]}\nD. {all_options[3]}\n"
+                    f"Do not add any extra text in the final answer.\n"
+                    f"Put the final answer inside \\boxed{{}}.\n give your answer in the beginning of the your sentence.\n"
+                    f"Answer:"
+                )
+            else:
+                # Build prompt similar to MMLU format
+                prompt = (
+                    f"Question: {question}\n"
+                    f"Which of the following answers is correct?\n"
+                    f"A. {all_options[0]}\nB. {all_options[1]}\n"
+                    f"C. {all_options[2]}\nD. {all_options[3]}\n"
+                    f"State the letter corresponding to the correct answer.\nAnswer:"
+                )
             
             return (prompt, correct_letter, wrong_letter)
         

@@ -30,8 +30,8 @@ class Config:
 
     DEV_RATIO = 0.2
 
-    DATASETS = ["gsm8k"]
-    MAX_SAMPLES = 100
+    DATASETS = ["mmlu","xnli","winogrande", "sst2", "sst5", "truthfulqa"]
+    MAX_SAMPLES = 1000
     VECTOR_BATCH_SIZE = 20
     DATA_ROOT = "/data4/xuanbo.su/ORBIT/data"
 
@@ -81,7 +81,7 @@ def get_raw_vector(model: CAAModelWrapper, dataset: str) -> Dict[str, torch.Tens
         steering_token_position=Config.TOKEN_POS
     )
     
-    diff_calc = ContinuousDiffCalculator(model, cfg, format_type="chat")
+    diff_calc = ContinuousDiffCalculator(model, cfg, format_type="generation")
     
     all_diffs = []
     batch_size = Config.VECTOR_BATCH_SIZE
@@ -148,8 +148,8 @@ def main():
     print(f">>> Loading Model: {Config.MODEL_NAME}")
 
     rollout_config = RolloutConfig(
-        format_type="chat",  
-        max_new_tokens=128,
+        format_type='generation',  
+        max_new_tokens=8,
         temperature=1.0 
     )
 
@@ -229,7 +229,7 @@ def main():
                     batch_qs = list(qs_local)[i : i + eval_batch_size]
                     batch_resps = intervention.generate_with_intervention(
                         batch_qs, 
-                        max_new_tokens=1024, 
+                        max_new_tokens=8, 
                         token_position=-1,
                         do_sample=False  
                     )

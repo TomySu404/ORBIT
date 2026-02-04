@@ -367,6 +367,7 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        
 def tune_hyperparameters(
     model, train_data, dev_data,
     rollout_config, intervention_config,
@@ -383,8 +384,11 @@ def tune_hyperparameters(
     """
     # Define hyperparameter search space
     param_grid = {
-        'strength': [1e-3,0.01, 0.05, 0.08, 0.2, 0.5, 1, 2],
+        'strength': [2,10,20],
     }
+    # Add sadi_topk to search space if SADI is enabled
+    if intervention_config.use_sadi:
+        param_grid['sadi_topk'] = [2,5,10]
     # Generate all combinations dynamically
     keys, values = zip(*param_grid.items())
     all_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
@@ -434,9 +438,12 @@ def tune_hyperparameters(
             'strength', intervention_config.intervention_strength)
         curr_layers = config.get('num_layers', intervention_config.num_layers)
         curr_components = config.get('components', intervention_config.components)
+        # Get sadi_topk only if SADI is enabled
+        curr_topk = config.get('sadi_topk', intervention_config.sadi_topk) if intervention_config.use_sadi else intervention_config.sadi_topk
         print_rank0(f"\n🔧 Config {i+1}/{len(all_combinations)}: "
               f"strength={curr_strength}, layers={curr_layers}, "
-              f"components={curr_components}")
+              f"components={curr_components}" + 
+              (f", topk={curr_topk}" if intervention_config.use_sadi else ""))
         try:
             # Create config with current hyperparameters
             current_intervention_config = InterventionConfig(
@@ -445,7 +452,14 @@ def tune_hyperparameters(
                 scaling_method=intervention_config.scaling_method,
                 intervention_strength=curr_strength,  # Only strength changes
                 components=curr_components,
-                prefill_only=intervention_config.prefill_only
+                prefill_only=intervention_config.prefill_only,
+                steering_token_position=intervention_config.steering_token_position,
+                use_grouped_normalization=intervention_config.use_grouped_normalization,
+                # SADI
+                use_sadi=intervention_config.use_sadi,
+                sadi_topk=curr_topk,  # Use current topk from config
+                sadi_selection=intervention_config.sadi_selection,
+                sadi_mask_scope=intervention_config.sadi_mask_scope
             )
             # Reuse pre-computed steering vectors, only create intervention with new strength
             intervention = ActivationIntervention(
@@ -480,6 +494,9 @@ def tune_hyperparameters(
                     'num_layers': curr_layers,
                     'components': curr_components
                 }
+                # Add sadi_topk to best_config if SADI is enabled
+                if intervention_config.use_sadi:
+                    best_config['sadi_topk'] = curr_topk
         except Exception as e:
             print_rank0(f"❌ Failed: {e}")
             dev_results.append({
@@ -1479,6 +1496,9 @@ def main():
                 'num_layers': current_intervention_config.num_layers,
                 'components': current_intervention_config.components
             }
+            # Add sadi_topk to best_hyper_config if SADI is enabled
+            if current_intervention_config.use_sadi:
+                best_hyper_config['sadi_topk'] = current_intervention_config.sadi_topk
             dev_results = []
             dev_baseline_result = None
             tune_steering_data = None  # Will store steering data from tuning if available
@@ -1506,8 +1526,12 @@ def main():
                 current_intervention_config.intervention_strength = best_hyper_config['strength']
                 current_intervention_config.num_layers = best_hyper_config['num_layers']
                 current_intervention_config.components = best_hyper_config['components']
+                # Update sadi_topk if SADI is enabled and it's in best_hyper_config
+                if current_intervention_config.use_sadi and 'sadi_topk' in best_hyper_config:
+                    current_intervention_config.sadi_topk = best_hyper_config['sadi_topk']
+                topk_info = f", topk={best_hyper_config['sadi_topk']}" if current_intervention_config.use_sadi and 'sadi_topk' in best_hyper_config else ""
                 print_rank0(f"🏆 Best hyperparameters: strength={best_hyper_config['strength']}, "
-                      f"layers={best_hyper_config['num_layers']}, components={best_hyper_config['components']}")
+                      f"layers={best_hyper_config['num_layers']}, components={best_hyper_config['components']}{topk_info}")
             # Standard experiment on test set
             baseline_result = None
             if args.eval_baseline:
@@ -1674,31 +1698,4 @@ def main():
             cleanup_distributed()
         
 if __name__ == "__main__":
-    sys.argv = [
-        sys.argv[0],
-        "--model", "/data2/models/Qwen3-0.6B",
-        "--dataset", "sst2",
-        "--data_root", "/data1/hao.luo/project/steering_vectors/data",
-        "--batch_size", "32",
-        "--max_train", "100",
-        "--num_rollouts", "32",
-        "--max_new_tokens", "128",
-        "--components", "attn",
-        "--layer_scope", "all",
-        "--scaling", "max_norm",
-        "--num_layers", "5",
-        "--max_tune_samples", "1000",
-        "--strength", "6",
-        "--tune_hyperparams",
-        "--grouped_normalization",
-        "--prefill_only",
-        "--output_dir", "./results_models",
-        "--format_type", "chat",
-        "--parallel_gpus",
-        "--seeds", "42", "52",
-        "--sadi",
-        "--sadi_topk", "5",
-        "--sadi_selection", "pos",
-        "--sadi_mask_scope", "global",
-    ]
     main()

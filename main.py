@@ -217,16 +217,23 @@ def _merge_steering_results(chunk_results: List[Dict], intervention_config: Inte
     }
 
     # Properly merge diff_results from all chunks using weighted average
-    # Weight by pair_count to ensure correct aggregation
-    total_pair_count = sum(r["diff_result"].pair_count for r in chunk_results)
-    if total_pair_count == 0:
-        raise RuntimeError("No pairs found in any chunk results")
+    # Use sample_count for grouped normalization, otherwise pair_count
+    use_grouped = intervention_config.use_grouped_normalization
+    if use_grouped:
+        total_count = sum(r["diff_result"].sample_count for r in chunk_results)
+        count_type = "samples"
+    else:
+        total_count = sum(r["diff_result"].pair_count for r in chunk_results)
+        count_type = "pairs"
+
+    if total_count == 0:
+        raise RuntimeError(f"No {count_type} found in any chunk results")
 
     # Get layer names from first chunk (all should have same layers)
     first_diff_result = chunk_results[0]["diff_result"]
     layer_names = list(first_diff_result.diff_vectors.keys())
 
-    # Merge diff_vectors using weighted average based on pair_count
+    # Merge diff_vectors using weighted average
     merged_diff_vectors = {}
 
     # Pre-compute all weights to avoid repeated division
@@ -234,8 +241,9 @@ def _merge_steering_results(chunk_results: List[Dict], intervention_config: Inte
     valid_chunks = []
     for chunk_result in chunk_results:
         diff_result = chunk_result["diff_result"]
-        weight = diff_result.pair_count / total_pair_count if total_pair_count > 0 else 0.0
-        if weight > 0 and diff_result.pair_count > 0:
+        count = diff_result.sample_count if use_grouped else diff_result.pair_count
+        weight = count / total_count if total_count > 0 else 0.0
+        if weight > 0 and count > 0:
             chunk_weights.append(weight)
             valid_chunks.append(chunk_result)
 
@@ -265,41 +273,26 @@ def _merge_steering_results(chunk_results: List[Dict], intervention_config: Inte
     scaling_method = intervention_config.scaling_method
     merged_scaling_weights = {}
 
-    # OPTIMIZED: Batch GPU transfer and scaling computation
-    # Instead of transferring each layer individually (slow due to sync overhead),
-    # stack all layers, transfer once, compute all scalings, transfer back once
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Compute scaling per layer
+    # We don't stack all layers because they might have different dimensions (e.g., MLP vs Attention)
+    for layer_name in layer_names:
+        diff = merged_diff_vectors[layer_name]
+        
+        if scaling_method == "max_norm":
+            max_val = torch.max(torch.abs(diff))
+            merged_scaling_weights[layer_name] = diff / torch.clamp(max_val, min=eps)
 
-    # Stack all diff vectors: [num_layers, hidden_dim] - single GPU transfer
-    all_diffs_list = [merged_diff_vectors[layer_name] for layer_name in layer_names]
-    all_diffs_stacked = torch.stack(all_diffs_list).to(device)
+        elif scaling_method == "l2_norm":
+            norm = torch.norm(diff, p=2)
+            merged_scaling_weights[layer_name] = diff / torch.clamp(norm, min=eps)
 
-    if scaling_method == "max_norm":
-        # Compute max for each layer: [num_layers, 1]
-        max_vals = torch.max(torch.abs(all_diffs_stacked), dim=1, keepdim=True).values
-        max_vals = torch.clamp(max_vals, min=eps)  # Avoid division by zero
-        all_scaled = all_diffs_stacked / max_vals
+        elif scaling_method == "softmax":
+            abs_diff = torch.abs(diff)
+            weights = torch.softmax(abs_diff, dim=0)
+            merged_scaling_weights[layer_name] = weights * torch.sign(diff) * diff.shape[0]
 
-    elif scaling_method == "l2_norm":
-        # Compute L2 norm for each layer: [num_layers, 1]
-        norms = torch.norm(all_diffs_stacked, p=2, dim=1, keepdim=True)
-        norms = torch.clamp(norms, min=eps)
-        all_scaled = all_diffs_stacked / norms
-
-    elif scaling_method == "softmax":
-        # Softmax per layer
-        abs_diffs = torch.abs(all_diffs_stacked)
-        weights = torch.softmax(abs_diffs, dim=1)
-        hidden_dim = all_diffs_stacked.shape[1]
-        all_scaled = weights * torch.sign(all_diffs_stacked) * hidden_dim
-
-    else:
-        raise ValueError(f"Unknown scaling method: {scaling_method}")
-
-    # Single transfer back to CPU and unpack results
-    all_scaled_cpu = all_scaled.cpu()
-    for i, layer_name in enumerate(layer_names):
-        merged_scaling_weights[layer_name] = all_scaled_cpu[i]
+        elif scaling_method == "none":
+            merged_scaling_weights[layer_name] = diff
     
     # Aggregate sample and pair counts
     merged_sample_count = sum(r["diff_result"].sample_count for r in chunk_results)
@@ -321,9 +314,9 @@ def _merge_steering_results(chunk_results: List[Dict], intervention_config: Inte
         "layer_indices": chunk_results[0]["layer_indices"]
     }
 
-    print(f"📊 Merged steering results from {len(chunk_results)} chunks")
-    print(f"   Total samples: {merged_stats['total_samples']}")
-    print(f"   Total pairs: {merged_stats['total_pairs']}")
+    print_rank0(f"📊 Merged steering results from {len(chunk_results)} chunks")
+    print_rank0(f"   Total samples: {merged_stats['total_samples']}")
+    print_rank0(f"   Total pairs: {merged_stats['total_pairs']}")
 
     return merged_result
 
@@ -380,7 +373,8 @@ def tune_hyperparameters(
     """
     # Define hyperparameter search space
     param_grid = {
-        'strength': [1e-3,0.01, 0.05, 0.08, 0.2, 0.5, 1, 2],
+        'strength': [1e-3, 2e-2, 3, 5, 10],
+        'components': [['mlp_act'], ['attn_out'], ['mlp'], ['attn']],
     }
     # Generate all combinations dynamically
     keys, values = zip(*param_grid.items())
@@ -430,7 +424,10 @@ def tune_hyperparameters(
                 scaling_method=intervention_config.scaling_method,
                 intervention_strength=curr_strength,  # Only strength changes
                 components=curr_components,
-                prefill_only=intervention_config.prefill_only
+                prefill_only=intervention_config.prefill_only,
+                steering_token_position=intervention_config.steering_token_position,
+                use_grouped_normalization=intervention_config.use_grouped_normalization,
+                intervention_type=intervention_config.intervention_type
             )
             # Reuse pre-computed steering vectors, only create intervention with new strength
             intervention = ActivationIntervention(
@@ -583,14 +580,10 @@ def build_steering_vectors(
                 print_rank0(p.get("traceback", ""))
         raise RuntimeError("Distributed build_steering_vectors failed on at least one rank. See rank0 logs.")
 
-    # Merge results on rank 0
-    if is_main_process():
-        result_list = [p["result"] for p in gathered]
-        merged_result = _merge_steering_results(result_list, intervention_config)
-        return merged_result
-
-    # Return local result for non-main processes (though it won't be used)
-    return local_result
+    # Merge results on ALL ranks to ensure consistency
+    result_list = [p["result"] for p in gathered]
+    merged_result = _merge_steering_results(result_list, intervention_config)
+    return merged_result
 
 
 def _build_steering_vectors_single_gpu(
@@ -955,6 +948,11 @@ def main():
         help="Maximum new tokens for evaluation"
     )
     parser.add_argument(
+        "--max_rollout_tokens", type=int,
+        default=4,
+        help="Maximum new tokens for rollout generation"
+    )
+    parser.add_argument(
         "--batch_size", type=int,
         default=16,
         help="Batch size for evaluation"
@@ -991,12 +989,12 @@ def main():
     )
     parser.add_argument(
         "--reread_weight", type=float,
-        default=0.5,
+        default=1,
         help="Weight for re-read samples (< 1 to down-weight)"
     )
     parser.add_argument(
         "--diff_batch_size", type=int,
-        default=32,
+        default=8,
         help="Batch size for diff computation (pairs per batch)"
     )
     # Intervention arguments
@@ -1008,7 +1006,7 @@ def main():
     parser.add_argument(
         "--scaling", type=str,
         default="max_norm",
-        choices=["softmax", "l2_norm", "max_norm"],
+        choices=["softmax", "l2_norm", "max_norm", "none"],
         help="Scaling method for continuous weights"
     )
     parser.add_argument(
@@ -1024,12 +1022,18 @@ def main():
     )
     parser.add_argument(
         "--components", type=str,
-        default="mlp_act",
+        default="mlp_act,attn_out",
         help="Comma-separated list of components to intervene"
     )
     parser.add_argument(
         "--prefill_only", action="store_true",
         help="Only intervene during prefill phase, not during token generation"
+    )
+    parser.add_argument(
+        "--intervention_type", type=str,
+        default="add",
+        choices=["add", "mul"],
+        help="Intervention logic: 'add' for additive (A = A + alpha*diff), 'mul' for multiplicative (A = A + A*(alpha*diff))"
     )
     parser.add_argument(
         "--seeds", type=int, nargs="+",
@@ -1052,7 +1056,7 @@ def main():
     )
     parser.add_argument(
         "--max_tune_samples", type=int,
-        default=80,
+        default=1000,
         help="Maximum training samples to use during hyperparameter tuning"
     )
     parser.add_argument(
@@ -1127,7 +1131,7 @@ def main():
         num_rollouts=args.num_rollouts,
         temperature=args.temperature,
         top_p=args.top_p,
-        max_new_tokens=args.max_new_tokens,
+        max_rollout_tokens=args.max_rollout_tokens,
         use_reread_fallback=not args.no_reread,
         format_type=args.format_type,
         enable_thinking=args.enable_thinking
@@ -1141,7 +1145,8 @@ def main():
         components=args.components.split(","),
         prefill_only=args.prefill_only,
         steering_token_position=args.steering_token_position,
-        use_grouped_normalization=args.grouped_normalization
+        use_grouped_normalization=args.grouped_normalization,
+        intervention_type=args.intervention_type
     )
     try:
         for data in args.datasets:
@@ -1152,10 +1157,10 @@ def main():
             print_rank0("="*60)
             print_rank0(f"Model: {args.model}")
             print_rank0(
-                f"Dataset: {args.dataset}, Tokens: {args.max_new_tokens}, Batch: {args.batch_size}")
+                f"Dataset: {args.dataset}, Eval Tokens: {args.max_new_tokens}, Rollout Tokens: {args.max_rollout_tokens}, Batch: {args.batch_size}")
             print_rank0(f"Baseline Evaluation: {'enabled' if args.eval_baseline else 'skipped'}")
             print_rank0(f"Rollouts: {args.num_rollouts} @ T={args.temperature}")
-            print_rank0(f"Scaling: {args.scaling}, Strength: {args.strength}")
+            print_rank0(f"Scaling: {args.scaling}, Strength: {args.strength}, Type: {args.intervention_type}")
             print_rank0(f"Layer scope: {args.layer_scope} (n={args.num_layers})")
             print_rank0(f"Prefill only: {'enabled' if args.prefill_only else 'disabled'}")
             print_rank0(
@@ -1180,7 +1185,7 @@ def main():
         model = ModelWrapper(temp_exp_config)
         # Load dataset once
         print_rank0(f"\n📂 Loading dataset: {args.dataset}")
-        loader = DatasetLoader(data_root=args.data_root)
+        loader = DatasetLoader(data_root=args.data_root, model_name=args.model)
         train_data, full_test_data = loader.load(
             args.dataset,
             max_train=args.max_train,
@@ -1362,6 +1367,7 @@ def main():
                 "model": args.model,
                 "dataset": args.dataset,
                 "max_new_tokens": args.max_new_tokens,
+                "max_rollout_tokens": args.max_rollout_tokens,
                 "batch_size": args.batch_size,
                 "eval_baseline": args.eval_baseline,
                 "num_rollouts": args.num_rollouts,
@@ -1375,6 +1381,7 @@ def main():
                 "enable_thinking": args.enable_thinking,
                 "steering_token_position": args.steering_token_position,
                 "grouped_normalization": args.grouped_normalization,
+                "intervention_type": args.intervention_type,
                 "seeds": args.seeds,
                 "components": current_intervention_config.components,
                 "prefill_only": args.prefill_only

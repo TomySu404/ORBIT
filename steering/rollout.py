@@ -133,11 +133,12 @@ class RolloutGenerator:
         """
         return self.model.generate(
                 question,
-                max_new_tokens=self.config.max_new_tokens,
+                max_new_tokens=self.config.max_rollout_tokens,
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
                 do_sample=True,
-                num_return_sequences=self.config.num_rollouts
+                num_return_sequences=self.config.num_rollouts,
+                repetition_penalty=self.config.repetition_penalty
         )
     
     def build_contrastive_pairs(

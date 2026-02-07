@@ -195,14 +195,32 @@ class ModelWrapper:
         if format_type == "chat":
             # Use chat template if available
             if hasattr(self.tokenizer, "apply_chat_template") and self.tokenizer.chat_template is not None:
-                messages = [
-                    {"role": "user", "content": question},
-                    {"role": "assistant", "content": answer} if answer else None
-                ]
+                # Special handling for Gemma-3 models
+                # Gemma-3 requires content to be a list of dicts with "type" and "text" fields
+                if self.model_type == ModelType.GEMMA3:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": question}]
+                        }
+                    ]
+                    if answer:
+                        messages.append({
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": answer}]
+                        })
+                else:
+                    # Standard format for other models
+                    messages = [
+                        {"role": "user", "content": question}
+                    ]
+                    if answer:
+                        messages.append({"role": "assistant", "content": answer})
+                
                 formatted = self.tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
-                    add_generation_prompt=True,
+                    add_generation_prompt=(not answer),  # Only add generation prompt if no answer provided
                     enable_thinking=enable_thinking
                 )
                 return formatted
@@ -331,7 +349,8 @@ class ModelWrapper:
         temperature: float = 1.0,
         top_p: float = 0.9,
         do_sample: bool = True,
-        num_return_sequences: int = 1
+        num_return_sequences: int = 1,
+        repetition_penalty: float = 1.0
     ) -> List[str]:
         """
         Generate responses for a given prompt or batch of prompts.
@@ -343,6 +362,7 @@ class ModelWrapper:
             top_p: Nucleus sampling probability threshold.
             do_sample: Whether to use sampling (False = greedy decoding).
             num_return_sequences: Number of sequences to return.
+            repetition_penalty: Penalty for repetition (1.0 = no penalty, >1.0 = penalize repetition).
         
         Returns:
             List of generated response strings (prompt excluded).
@@ -365,6 +385,7 @@ class ModelWrapper:
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "num_return_sequences": num_return_sequences,
+            "repetition_penalty": repetition_penalty,
         }
         
         if do_sample:

@@ -31,10 +31,11 @@ class RolloutConfig:
     num_rollouts: int = 8
     temperature: float = 0.8
     top_p: float = 0.9
-    max_new_tokens: int = 4
+    max_rollout_tokens: int = 4
     use_reread_fallback: bool = True
     format_type: str = "generation"  # "generation" or "chat" - format for prompt construction
     enable_thinking: bool = False  # Enable thinking tokens in chat template
+    repetition_penalty: float = 1
 
 
 @dataclass
@@ -42,13 +43,14 @@ class InterventionConfig:
     """Configuration for activation intervention (CSS)."""
     layer_scope: LayerScope = LayerScope.FIRST_N
     num_layers: int = 5
-    scaling_method: str = "max_norm"  # choices: "softmax", "l2_norm", "max_norm"
+    scaling_method: str = "max_norm"  # choices: "softmax", "l2_norm", "max_norm", "none"
     intervention_strength: float = 1.0
     components: List[str] = field(default_factory=lambda: ["mlp_act"])
     prefill_only: bool = True
     custom_layers: Optional[List[int]] = None
     steering_token_position: int = -1  # Token position for computing steering vectors (-1 for last token)
     use_grouped_normalization: bool = False  # If True, normalize per-question before global averaging
+    intervention_type: str = "add"  # choices: "add", "mul"
 
 
 @dataclass

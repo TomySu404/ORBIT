@@ -158,6 +158,10 @@ class ContinuousDiffCalculator:
             # Scale by dimension and restore sign
             return weights * torch.sign(diff) * diff.shape[-1]
         
+        elif method == "none":
+            # No scaling, return raw diff
+            return diff
+        
         else:
             raise ValueError(f"Unknown scaling method: {method}")
     
@@ -389,6 +393,7 @@ class ContinuousDiffCalculator:
         # Store normalized vectors for each question
         question_vectors = {name: [] for name in layer_names}
         total_reread_count = 0
+        processed_questions = 0
         
         current_idx = 0
         for num_pairs in pairs_per_question:
@@ -402,6 +407,7 @@ class ContinuousDiffCalculator:
             # 2. Compute intra-group weighted average
             q_result = self.aggregate_diffs(q_diffs, q_flags, reread_weight)
             total_reread_count += q_result.reread_sample_count
+            processed_questions += 1
             
             # 3. Store the normalized vector (scaling_weights already computed in aggregate_diffs)
             # The "steering direction" for this question is: diff_vector (already mean)
@@ -421,18 +427,21 @@ class ContinuousDiffCalculator:
                 final_diff_vectors[name] = stacked.mean(dim=0)
             else:
                 final_diff_vectors[name] = torch.zeros_like(first_tensor)
-        
-        # 5. Since we already applied scaling per-question, set final scaling_weights to ones
-        # This ensures that during intervention: h' = h + alpha * (1.0) * final_diff
-        # The direction is already "baked in" from per-question normalization
+
+        # 5. Re-normalize the averaged vector to match the configured scaling method
+        # This keeps the final direction consistent with the expected normalization behavior.
         final_scaling_weights = {
-            name: torch.ones_like(v) for name, v in final_diff_vectors.items()
+            name: self._compute_scaling_weights(
+                final_diff_vectors[name],
+                self.config.scaling_method
+            )
+            for name in layer_names
         }
         
         return DiffVectorResult(
             diff_vectors=final_diff_vectors,
             scaling_weights=final_scaling_weights,
-            sample_count=len(pairs_per_question),
+            sample_count=processed_questions,
             pair_count=len(all_diffs),
             reread_sample_count=total_reread_count
         )

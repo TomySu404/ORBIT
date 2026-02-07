@@ -77,7 +77,18 @@ class ActivationIntervention:
         interventions = {}
         strength = self.config.intervention_strength
         
+        # Get target module paths for current components
+        # e.g., if components=['mlp_act'], target_paths=['mlp.act_fn']
+        target_paths = []
+        for comp in self.config.components:
+            path = self.model.layer_pattern.get(comp, comp)
+            target_paths.append(path)
+        
         for name in self.diff_result.diff_vectors:
+            # Filter by current components: layer name must contain one of the target paths
+            if not any(target in name for target in target_paths):
+                continue
+                
             beta = self.diff_result.scaling_weights[name]
             
             # Intervention = strength * beta
@@ -86,8 +97,8 @@ class ActivationIntervention:
             # So intervention = strength * mu / max(|mu|)
             # This naturally emphasizes dimensions with larger differences
             intervention = strength * beta
-            # Move to model device
-            interventions[name] = intervention.to(self.model.device)
+            # Move to model device and cast to model dtype for efficiency
+            interventions[name] = intervention.to(self.model.device).to(self.model.dtype)
         
         return interventions
     
@@ -117,6 +128,7 @@ class ActivationIntervention:
         intervention: torch.Tensor,
         config_prefill_only: bool,
         initial_seq_len_ref: List,  # Use list to allow mutation
+        intervention_type: str = "add",
         token_position: int = -1
     ):
         """
@@ -129,6 +141,7 @@ class ActivationIntervention:
             intervention: Pre-computed intervention tensor
             config_prefill_only: Whether to only intervene during prefill
             initial_seq_len_ref: Mutable reference to initial sequence length [seq_len]
+            intervention_type: Intervention logic ("add" or "mul")
             token_position: Token position to intervene
         """
         # Handle tuple outputs (some layers return (hidden_states, ...))
@@ -156,22 +169,32 @@ class ActivationIntervention:
                     return (hidden,) + rest
                 return hidden
 
-        # Ensure intervention is on correct device and dtype
-        interv = intervention.to(hidden.device).to(hidden.dtype)
+        # Ensure intervention is on correct device (dtype already handled in precompute)
+        interv = intervention.to(hidden.device)
 
         # Apply intervention at specified token position
         # hidden shape: [batch, seq_len, hidden_dim]
         if token_position == -1:
             # Intervene on last token (most common case)
             hidden = hidden.clone()
-            hidden[:, -1, :] = hidden[:, -1, :] + interv
+            if intervention_type == "add":
+                hidden[:, -1, :] = hidden[:, -1, :] + interv
+            elif intervention_type == "mul":
+                # Multiplicative intervention: A' = A + A * (interv)
+                hidden[:, -1, :] = hidden[:, -1, :] * (1.0 + interv)
         elif token_position >= 0:
             hidden = hidden.clone()
-            hidden[:, token_position, :] = hidden[:, token_position, :] + interv
+            if intervention_type == "add":
+                hidden[:, token_position, :] = hidden[:, token_position, :] + interv
+            elif intervention_type == "mul":
+                hidden[:, token_position, :] = hidden[:, token_position, :] * (1.0 + interv)
         else:
             # Negative indexing
             hidden = hidden.clone()
-            hidden[:, token_position, :] = hidden[:, token_position, :] + interv
+            if intervention_type == "add":
+                hidden[:, token_position, :] = hidden[:, token_position, :] + interv
+            elif intervention_type == "mul":
+                hidden[:, token_position, :] = hidden[:, token_position, :] * (1.0 + interv)
 
         # Reconstruct output
         if is_tuple:
@@ -208,6 +231,7 @@ class ActivationIntervention:
             intervention=intervention,
             config_prefill_only=self.config.prefill_only,
             initial_seq_len_ref=self._initial_seq_len_ref,
+            intervention_type=self.config.intervention_type,
             token_position=token_position
         )
     

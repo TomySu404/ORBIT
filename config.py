@@ -51,6 +51,11 @@ class InterventionConfig:
     steering_token_position: int = -1  # Token position for computing steering vectors (-1 for last token)
     use_grouped_normalization: bool = False  # If True, normalize per-question before global averaging
     intervention_type: str = "add"  # choices: "add", "mul"
+    # Q2 extraction-context ablation: what the activation is read from.
+    # "full" is ROC as published; the others strip or replace the reasoning span while
+    # preserving the final answer. See steering/context_ablation.py.
+    extraction_context: str = "full"
+    extraction_context_seed: int = 0
 
 
 @dataclass

@@ -41,6 +41,7 @@ from models.wrapper import ModelWrapper
 from steering.rollout import RolloutGenerator
 from steering.diff_vector import ContinuousDiffCalculator, DiffVectorResult
 from steering.intervention import ActivationIntervention
+from steering import context_ablation
 from data.loader import DatasetLoader
 from utils.metrics import Evaluator, EvaluationResult
 
@@ -427,7 +428,9 @@ def tune_hyperparameters(
                 prefill_only=intervention_config.prefill_only,
                 steering_token_position=intervention_config.steering_token_position,
                 use_grouped_normalization=intervention_config.use_grouped_normalization,
-                intervention_type=intervention_config.intervention_type
+                intervention_type=intervention_config.intervention_type,
+                extraction_context=intervention_config.extraction_context,
+                extraction_context_seed=intervention_config.extraction_context_seed
             )
             # Reuse pre-computed steering vectors, only create intervention with new strength
             intervention = ActivationIntervention(
@@ -626,6 +629,7 @@ def _build_steering_vectors_single_gpu(
     iterator = tqdm_rank0(samples, desc="Generating rollouts") if show_progress else samples
 
     # Phase 1: Generate rollouts and collect contrastive pairs
+    kept_results = []
     for question, correct_ans, wrong_ans in iterator:
         stats["total_samples"] += 1
         # Generate rollouts and build contrastive pairs
@@ -641,19 +645,44 @@ def _build_steering_vectors_single_gpu(
             stats["samples_with_reread"] += 1
         else:
             stats["samples_with_rollout_correct"] += 1
+        kept_results.append((question, result))
+
+    # Phase 1b: apply the extraction-context transform, if any, and flatten to pairs.
+    # `mismatched` needs a donor rollout from a different question, which is why the
+    # pairs are only flattened once every question has been rolled out.
+    ctx_mode = getattr(intervention_config, "extraction_context", "full") or "full"
+    ctx_rng = random.Random(getattr(intervention_config, "extraction_context_seed", 0))
+    donor_pool = [r.correct_responses[0] for _, r in kept_results if r.correct_responses]
+
+    def _ctx(text, self_question):
+        if ctx_mode == "full":
+            return text
+        donor = None
+        if ctx_mode == "mismatched" and len(donor_pool) > 1:
+            for _ in range(8):
+                cand = ctx_rng.choice(donor_pool)
+                if cand != text:
+                    donor = cand
+                    break
+        return context_ablation.transform(
+            ctx_mode, text, model.tokenizer, ctx_rng, donor=donor)
+
+    for question, result in kept_results:
         # Record how many pairs this question contributes (for grouped normalization)
         pairs_per_question.append(len(result.contrastive_pairs))
         # Collect pairs for batch processing
         for pair in result.contrastive_pairs:
             all_pairs_data.append((
                 question,
-                pair.positive,
-                pair.negative,
+                _ctx(pair.positive, question),
+                _ctx(pair.negative, question),
                 pair.used_reread
             ))
             stats["total_pairs"] += 1
             if pair.used_reread:
                 stats["reread_pairs"] += 1
+    if ctx_mode != "full":
+        print_rank0(f"   Extraction context: {context_ablation.describe(ctx_mode)}")
     # Phase 2: Batch compute diffs
     all_diffs = []
     reread_flags = []
@@ -1086,6 +1115,18 @@ def main():
         "--grouped_normalization", action="store_true",
         help="Use per-question normalization before global averaging (One Question One Vote strategy)"
     )
+    parser.add_argument(
+        "--extraction_context", type=str, default="full",
+        choices=["full", "answer_only", "filler", "mismatched", "shuffled"],
+        help="Q2 ablation: what the steering activation is read from. 'full' is ROC as "
+             "published; 'answer_only' is the matched teacher-forced control; "
+             "'filler'/'mismatched'/'shuffled' hold context length fixed while removing "
+             "the reasoning content (see steering/context_ablation.py)"
+    )
+    parser.add_argument(
+        "--extraction_context_seed", type=int, default=0,
+        help="Seed for the extraction-context transform (donor choice, step permutation)"
+    )
     args = parser.parse_args()
     
     # Initialize distributed training if enabled
@@ -1146,7 +1187,9 @@ def main():
         prefill_only=args.prefill_only,
         steering_token_position=args.steering_token_position,
         use_grouped_normalization=args.grouped_normalization,
-        intervention_type=args.intervention_type
+        intervention_type=args.intervention_type,
+        extraction_context=args.extraction_context,
+        extraction_context_seed=args.extraction_context_seed
     )
     try:
         for data in args.datasets:

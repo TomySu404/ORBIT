@@ -13,6 +13,23 @@
 
 ---
 
+## Results
+
+ORBIT improves on the unsteered model in all 16 cells, across 8 models from 0.6B to 122B (dense and MoE, three families). Accuracy (%) ± std over three seeds.
+
+| Model | IFEval | + ORBIT | Δ | TruthfulQA | + ORBIT | Δ |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Qwen3-0.6B | 62.46 ± 1.27 | **63.27 ± 0.28** | +0.81 | 48.78 ± 0.52 | **49.91 ± 0.23** | +1.13 |
+| Qwen3-8B | 77.35 ± 0.32 | **80.50 ± 1.98** | +3.15 | 78.66 ± 0.16 | **81.62 ± 0.03** | +2.96 |
+| GLM4-9B | 81.02 ± 0.12 | **81.82 ± 0.42** | +0.80 | 53.83 ± 0.01 | **60.10 ± 0.17** | +6.27 |
+| Qwen3-14B | 79.89 ± 0.57 | **81.30 ± 0.28** | +1.41 | 80.31 ± 1.22 | **82.32 ± 0.44** | +2.01 |
+| Qwen3-32B | 80.31 ± 0.14 | **81.02 ± 0.71** | +0.71 | 85.39 ± 0.21 | **86.64 ± 0.21** | +1.25 |
+| GLM4-32B | 80.31 ± 0.71 | **81.11 ± 0.71** | +0.80 | 57.40 ± 1.66 | **69.51 ± 3.83** | +12.11 |
+| Llama-3-70B | 81.02 ± 0.44 | **82.19 ± 0.53** | +1.17 | 85.20 ± 0.61 | **86.83 ± 0.70** | +1.63 |
+| Qwen3.5-122B-A10B | 84.31 ± 0.29 | **85.12 ± 0.45** | +0.81 | 90.40 ± 0.22 | **91.35 ± 0.28** | +0.95 |
+
+<sub>Standard configuration: grouped normalization, L2 scaling, N = 1000 training questions (IFEval N = 100). The largest gains are on reasoning tasks, e.g. +9.7 on GSM8K at 0.6B.</sub>
+
 ## Overview
 
 Contrastive activation steering methods such as CAA, ITI and RepE usually build their steering direction from **text the experimenter writes**, for example a gold answer versus a wrong one. The activations are recorded while the model *reads* that text, not while it *reasons*.
